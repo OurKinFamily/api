@@ -45,16 +45,18 @@ jobs:
           sudo dpkg -i cloudflared.deb
 
       - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          proxy_host: ${{ secrets.DEPLOY_HOST }}
-          proxy_username: ${{ secrets.DEPLOY_USER }}
-          proxy_key: ${{ secrets.DEPLOY_SSH_KEY }}
-          proxy_command: cloudflared access ssh --hostname %h
-          script: |
-            cd /home/stephen/Documents/ourkin/deploy
-            docker compose -f docker-compose.yml -f docker-compose.${{ github.ref_name == 'main' && 'prod' || 'staging' }}.yml pull api
-            docker compose -f docker-compose.yml -f docker-compose.${{ github.ref_name == 'main' && 'prod' || 'staging' }}.yml up -d api
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          ENV: ${{ github.ref_name == 'main' && 'prod' || 'staging' }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -i ~/.ssh/deploy_key \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            "cd /home/stephen/Documents/ourkin/deploy && \
+             docker compose -f docker-compose.yml -f docker-compose.${ENV}.yml pull api && \
+             docker compose -f docker-compose.yml -f docker-compose.${ENV}.yml up -d api"
