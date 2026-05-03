@@ -7,7 +7,7 @@ on:
       - staging
 
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -39,27 +39,15 @@ jobs:
           push: true
           tags: ghcr.io/ourkinfamily/api:${{ steps.tag.outputs.tag }}
 
-      - name: Install cloudflared
-        run: |
-          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
-          sudo dpkg -i cloudflared.deb
+  deploy:
+    needs: build
+    runs-on: self-hosted
 
-      - name: Deploy via SSH
+    steps:
+      - name: Deploy
         env:
-          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           ENV: ${{ github.ref_name == 'main' && 'prod' || 'staging' }}
-          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
-          mkdir -p ~/.ssh ~/.cloudflared
-          echo "${{ secrets.CF_CERT }}" > ~/.cloudflared/cert.pem
-          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh \
-            -o StrictHostKeyChecking=no \
-            -o ProxyCommand="cloudflared access ssh --hostname %h" \
-            -i ~/.ssh/deploy_key \
-            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
-            "cd /home/stephen/Documents/ourkin/deploy && \
-             docker compose -f docker-compose.yml -f docker-compose.${ENV}.yml pull api && \
-             docker compose -f docker-compose.yml -f docker-compose.${ENV}.yml up -d api"
+          cd /home/stephen/Documents/ourkin/deploy
+          docker compose -f docker-compose.yml -f docker-compose.${ENV}.yml pull api
+          docker compose -f docker-compose.yml -f docker-compose.${ENV}.yml up -d api
