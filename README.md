@@ -42,7 +42,15 @@ pytest
 
 Tests use mocked Neo4j sessions — no running database required.
 
-## CI/CD
+## CI/CD & Branch Flow
 
-Push to `staging` → runs tests → builds `ghcr.io/ourkinfamily/api:staging` → deploys to staging.ourkin.family  
-Push to `main` → runs tests → builds `ghcr.io/ourkinfamily/api:latest` → deploys to www.ourkin.family
+```
+feature/* → PR → staging → PR → main
+```
+
+- PRs target `staging` by default
+- Merging to `staging` → tests → builds `ghcr.io/ourkinfamily/api:staging` → deploys to staging.ourkin.family
+- Merging to `main` → tests → builds `ghcr.io/ourkinfamily/api:latest` → deploys to www.ourkin.family
+- PRs to `main` are blocked unless the source branch is `staging`
+
+Both branches are protected — no direct pushes. `staging` allows admin bypass for emergencies.
