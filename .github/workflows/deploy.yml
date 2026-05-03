@@ -81,5 +81,10 @@ jobs:
           ENV: ${{ github.ref_name == 'main' && 'prod' || 'staging' }}
         run: |
           cd /home/stephen/Documents/ourkin/deploy
-          docker compose -f docker-compose.yml -f docker-compose.${ENV}.yml pull api
-          docker compose -f docker-compose.yml -f docker-compose.${ENV}.yml up -d --no-deps api
+          if [ "$ENV" = "prod" ]; then
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml pull api
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --no-deps api
+          else
+            docker compose -p ourkin-staging -f docker-compose.staging-only.yml pull api
+            docker compose -p ourkin-staging -f docker-compose.staging-only.yml up -d --no-deps api
+          fi
