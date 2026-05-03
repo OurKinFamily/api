@@ -10,18 +10,19 @@ source venv/bin/activate
 pip install -r requirements-dev.txt
 ```
 
-Requires a running Neo4j instance. Start one from `../db/graph/`:
+The staging Neo4j is exposed on `localhost:7688` — use that for local dev so you're working against real data without spinning up a separate database.
+
+Copy the example env file:
 
 ```bash
-cd ../db/graph
-docker compose up -d
-bash load.sh   # load schema + seed data (first time only)
+cp .env.local.example .env
+# fill in NEO4J_PASSWORD
 ```
 
-Set env vars (copy from `.env.example` or create `.env`):
+Or set manually:
 
 ```bash
-NEO4J_URI=bolt://localhost:7687
+NEO4J_URI=bolt://localhost:7688
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=your-password
 ```
