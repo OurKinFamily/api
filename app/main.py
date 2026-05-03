@@ -12,7 +12,7 @@ async def lifespan(app: FastAPI):
     await close_driver()
 
 
-app = FastAPI(title="mykin API", lifespan=lifespan)
+app = FastAPI(title="ourkin API", lifespan=lifespan)
 
 app.add_middleware(AuthMiddleware)
 

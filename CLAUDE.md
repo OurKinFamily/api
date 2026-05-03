@@ -1,6 +1,10 @@
-# mykin — api
+# ourkin — api
 
-FastAPI backend for the mykin family archive.
+FastAPI backend for the ourkin family archive.
+
+## GitHub
+
+https://github.com/OurKinFamily/api
 
 ## Running
 
