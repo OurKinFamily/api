@@ -7,7 +7,25 @@ on:
       - staging
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -60,4 +78,4 @@ jobs:
         run: |
           cd /home/stephen/Documents/ourkin/deploy
           docker compose -f docker-compose.yml -f docker-compose.${ENV}.yml pull api
-          docker compose -f docker-compose.yml -f docker-compose.${ENV}.yml up -d api
+          docker compose -f docker-compose.yml -f docker-compose.${ENV}.yml up -d --no-deps api
