@@ -1,0 +1,42 @@
+[
+  {
+    "id": "faces-extract",
+    "name": "Face Detection",
+    "description": "Detect faces across the archive and write to DB",
+    "color": "#8b5cf6",
+    "shell_command": "docker exec ourkin-worker-face python -m face extract {path}",
+    "params": [
+      {
+        "name": "path",
+        "label": "Target path",
+        "type": "text",
+        "default": "/photos/archive",
+        "required": true,
+        "hint": "Path to scan for photos. The face worker will walk this directory recursively."
+      }
+    ]
+  },
+  {
+    "id": "faces-cluster",
+    "name": "Face Clustering",
+    "description": "Run DBSCAN on all face embeddings in the DB",
+    "color": "#6366f1",
+    "shell_command": "docker exec ourkin-worker-face python -m face cluster --eps {eps} --min-samples {min_samples}",
+    "params": [
+      {
+        "name": "eps",
+        "label": "DBSCAN eps",
+        "type": "text",
+        "default": "0.4",
+        "hint": "Max cosine distance within a cluster (0.0–1.0). Lower = stricter. 0.4 is a good default."
+      },
+      {
+        "name": "min_samples",
+        "label": "Min samples",
+        "type": "text",
+        "default": "3",
+        "hint": "Minimum faces to form a cluster. Higher = only frequent faces cluster."
+      }
+    ]
+  }
+]
