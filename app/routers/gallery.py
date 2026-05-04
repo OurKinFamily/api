@@ -1,105 +1,97 @@
 """
-Gallery API — paginated media list sorted by most recent first.
+Gallery API — paginated media list backed by Neo4j Photo nodes.
 
-Sorts by archive directory structure (year/month desc) which matches
-capture date for the vast majority of photos. The 0000/ directory
-(undated/unclassified) is placed last.
+Filters: min_confidence (default: high), year_from, year_to, media_type, person_id
+Sort:    actual capture timestamp DESC
 """
 
 import json
 import logging
 from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from app.config import settings
+from app.db.neo4j import get_session
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/gallery", tags=["gallery"])
 
-IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.heic', '.webp', '.tiff', '.tif', '.bmp', '.gif'}
 VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.m4v', '.mpg', '.mpeg'}
-MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 
-_photo_index: list[Path] | None = None
-
-
-def _build_index() -> list[Path]:
-    global _photo_index
-    if _photo_index is not None:
-        return _photo_index
-
-    archive = settings.photos_root / "archive"
-    if not archive.exists():
-        _photo_index = []
-        return _photo_index
-
-    dated: list[Path] = []
-    undated: list[Path] = []
-
-    for year_dir in sorted(archive.iterdir(), reverse=True):
-        if not year_dir.is_dir() or year_dir.name.startswith('_'):
-            continue
-        is_undated = year_dir.name == "0000"
-        for month_dir in sorted(year_dir.iterdir(), reverse=True):
-            if not month_dir.is_dir():
-                continue
-            files = sorted(
-                (f for f in month_dir.iterdir()
-                 if f.is_file() and f.suffix.lower() in MEDIA_EXTS),
-                reverse=True,
-            )
-            if is_undated:
-                undated.extend(files)
-            else:
-                dated.extend(files)
-
-    _photo_index = dated + undated
-    log.info(f"Gallery index built: {len(_photo_index):,} media files")
-    return _photo_index
-
-
-def _read_sidecar(photo_path: Path) -> dict:
-    sidecar = Path(str(photo_path) + ".json")
-    if not sidecar.exists():
-        return {}
-    try:
-        data = json.loads(sidecar.read_text())
-        results = data.get("results") or []
-        meta = (results[0].get("metadata", {}) if results else data.get("metadata", {}))
-        ts_block = meta.get("timestamps", {})
-        primary  = ts_block.get("primary", {})
-        media    = meta.get("media", {})
-        return {
-            "timestamp":       primary.get("timestamp"),
-            "confidence":      primary.get("confidence"),
-            "dominant_color":  media.get("dominantColor"),
-            "is_video":        photo_path.suffix.lower() in VIDEO_EXTS,
-        }
-    except Exception:
-        return {}
+CONFIDENCE_SETS = {
+    "high":   ["high"],
+    "medium": ["high", "medium"],
+    "low":    ["high", "medium", "low"],
+}
 
 
 @router.get("")
 async def list_media(
-    limit:  int = Query(default=48, le=100),
-    offset: int = Query(default=0, ge=0),
+    limit:          int           = Query(default=48, le=200),
+    offset:         int           = Query(default=0, ge=0),
+    min_confidence: str           = Query(default="high"),
+    year_from:      Optional[int] = Query(default=None),
+    year_to:        Optional[int] = Query(default=None),
+    media_type:     str           = Query(default="all"),   # photo | video | all
+    person_id:      Optional[str] = Query(default=None),
 ):
-    index = _build_index()
-    total = len(index)
-    page  = index[offset: offset + limit]
+    conditions = []
+    params: dict = {"offset": offset, "limit": limit}
+
+    if min_confidence in CONFIDENCE_SETS:
+        conditions.append("p.timestamp_confidence IN $conf_values")
+        params["conf_values"] = CONFIDENCE_SETS[min_confidence]
+
+    if year_from is not None:
+        conditions.append("p.timestamp >= $ts_from")
+        params["ts_from"] = f"{year_from}-01-01"
+
+    if year_to is not None:
+        conditions.append("p.timestamp < $ts_to")
+        params["ts_to"] = f"{year_to + 1}-01-01"
+
+    if media_type == "photo":
+        conditions.append("p.is_video = false")
+    elif media_type == "video":
+        conditions.append("p.is_video = true")
+
+    if person_id:
+        match = "MATCH (:Person {id: $person_id})-[:APPEARS_IN]->(p:Photo)"
+        params["person_id"] = person_id
+    else:
+        match = "MATCH (p:Photo)"
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    count_q = f"{match} {where} RETURN count(p) AS total"
+    data_q  = f"""
+        {match} {where}
+        RETURN p
+        ORDER BY p.timestamp DESC, p.path DESC
+        SKIP $offset LIMIT $limit
+    """
+
+    async with get_session() as session:
+        count_res  = await session.run(count_q, **params)
+        count_rec  = await count_res.single()
+        total      = count_rec["total"] if count_rec else 0
+
+        data_res   = await session.run(data_q, **params)
+        records    = await data_res.data()
 
     photos = []
-    for p in page:
-        rel  = p.relative_to(settings.photos_root)
-        info = _read_sidecar(p)
+    for r in records:
+        p    = r["p"]
+        path = p.get("path", "")
         photos.append({
-            "path":           str(rel),
-            "url":            f"/api/media/{rel}",
-            "filename":       p.name,
-            "timestamp":      info.get("timestamp"),
-            "confidence":     info.get("confidence"),
-            "dominant_color": info.get("dominant_color"),
-            "is_video":       info.get("is_video", p.suffix.lower() in VIDEO_EXTS),
+            "path":           path,
+            "url":            f"/api/media/{path}",
+            "filename":       p.get("filename") or Path(path).name,
+            "timestamp":      p.get("timestamp"),
+            "confidence":     p.get("timestamp_confidence"),
+            "dominant_color": p.get("dominant_color"),
+            "is_video":       p.get("is_video", False),
         })
 
     return {
@@ -126,16 +118,16 @@ async def media_detail(path: str = Query(...)):
         results = data.get("results") or []
         meta    = results[0].get("metadata", {}) if results else data.get("metadata", {})
 
-        file_m   = meta.get("file", {})
-        media    = meta.get("media", {})
-        dims     = media.get("dimensions", {})
-        ts       = meta.get("timestamps", {}).get("primary", {})
-        loc_block = meta.get("location", {})
+        file_m      = meta.get("file", {})
+        media       = meta.get("media", {})
+        dims        = media.get("dimensions", {})
+        ts          = meta.get("timestamps", {}).get("primary", {})
+        loc_block   = meta.get("location", {})
         primary_loc = loc_block.get("primary") or {}
-        geoloc   = loc_block.get("geolocation") or {}
-        camera   = meta.get("camera", {})
-        expos    = meta.get("settings", {})
-        proc     = meta.get("processing", {})
+        geoloc      = loc_block.get("geolocation") or {}
+        camera      = meta.get("camera", {})
+        expos       = meta.get("settings", {})
+        proc        = meta.get("processing", {})
 
         return {
             **base,
@@ -144,12 +136,12 @@ async def media_detail(path: str = Query(...)):
                 "mimeType": file_m.get("mimeType"),
             },
             "media": {
-                "type":        media.get("type"),
-                "format":      media.get("format"),
-                "width":       dims.get("width"),
-                "height":      dims.get("height"),
-                "megapixels":  dims.get("megapixels"),
-                "orientation": dims.get("orientation"),
+                "type":          media.get("type"),
+                "format":        media.get("format"),
+                "width":         dims.get("width"),
+                "height":        dims.get("height"),
+                "megapixels":    dims.get("megapixels"),
+                "orientation":   dims.get("orientation"),
                 "dominantColor": media.get("dominantColor"),
                 "meanColor":     media.get("meanColor"),
                 "salientColor":  media.get("salientColor"),
@@ -168,16 +160,16 @@ async def media_detail(path: str = Query(...)):
                 "county":    geoloc.get("county_name"),
             } if primary_loc.get("latitude") else None,
             "camera": {
-                "make":   camera.get("make"),
-                "model":  camera.get("model"),
-                "lens":   camera.get("lens"),
+                "make":  camera.get("make"),
+                "model": camera.get("model"),
+                "lens":  camera.get("lens"),
             } if camera else None,
             "settings": {
-                "iso":         expos.get("iso"),
-                "aperture":    expos.get("aperture"),
+                "iso":          expos.get("iso"),
+                "aperture":     expos.get("aperture"),
                 "shutterSpeed": expos.get("shutterSpeed"),
-                "focalLength": expos.get("focalLength"),
-                "flash":       expos.get("flash"),
+                "focalLength":  expos.get("focalLength"),
+                "flash":        expos.get("flash"),
             } if expos else None,
             "processing": {
                 "processor":   proc.get("processor"),
@@ -187,11 +179,3 @@ async def media_detail(path: str = Query(...)):
     except Exception as e:
         log.warning(f"Failed to parse sidecar for {path}: {e}")
         return base
-
-
-@router.post("/reindex")
-async def reindex():
-    global _photo_index
-    _photo_index = None
-    count = len(_build_index())
-    return {"count": count}
