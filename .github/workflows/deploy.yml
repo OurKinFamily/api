@@ -3,8 +3,8 @@ name: Build & Deploy
 on:
   push:
     branches:
+      - release-*
       - main
-      - staging
 
 jobs:
   test:
@@ -48,7 +48,7 @@ jobs:
       - name: Set image tag
         id: tag
         run: |
-          if [ "${{ github.ref_name }}" = "main" ]; then
+          if [[ "${{ github.ref_name }}" == release-* ]]; then
             echo "tag=latest" >> $GITHUB_OUTPUT
           else
             echo "tag=staging" >> $GITHUB_OUTPUT
@@ -78,7 +78,7 @@ jobs:
 
       - name: Deploy
         env:
-          ENV: ${{ github.ref_name == 'main' && 'prod' || 'staging' }}
+          ENV: ${{ startsWith(github.ref_name, 'release-') && 'prod' || 'staging' }}
         run: |
           cd /home/stephen/Documents/ourkin/deploy
           if [ "$ENV" = "prod" ]; then

@@ -2,6 +2,19 @@ from pydantic import BaseModel
 from typing import Optional
 
 
+class PersonCreate(BaseModel):
+    name: str
+    known_as: Optional[str] = None
+    birth_date: Optional[str] = None
+    birth_date_precision: Optional[str] = None
+
+
+class RelationshipAdd(BaseModel):
+    rel_type: str  # spouse | child | parent | sibling
+    target_id: str
+    parent_ids: list[str] = []
+
+
 class Person(BaseModel):
     id: str
     name: str
