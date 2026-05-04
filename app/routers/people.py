@@ -1,7 +1,12 @@
 import uuid
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from app.db.neo4j import get_session
 from app.models.person import Person, PersonCreate, RelationshipAdd
+
+
+class AvatarSet(BaseModel):
+    crop_path: str
 
 router = APIRouter(prefix="/people", tags=["people"])
 
@@ -113,6 +118,57 @@ async def add_relationship(person_id: str, body: RelationshipAdd):
 
         else:
             raise HTTPException(status_code=400, detail=f"Unknown relationship type: {body.rel_type}")
+
+
+@router.put("/{person_id}/avatar", status_code=204)
+async def set_avatar(person_id: str, body: AvatarSet):
+    async with get_session() as session:
+        result = await session.run(
+            "MATCH (p:Person {id: $id}) SET p.avatar = $avatar RETURN p",
+            id=person_id, avatar=body.crop_path
+        )
+        record = await result.single()
+        if not record:
+            raise HTTPException(status_code=404, detail="Person not found")
+
+
+@router.get("/{person_id}/faces")
+async def get_faces(person_id: str):
+    async with get_session() as session:
+        result = await session.run(
+            """
+            MATCH (p:Person {id: $id})-[r:APPEARS_IN]->(photo:Photo)
+            RETURN r.crop_path AS crop_path,
+                   r.face_index AS face_index,
+                   photo.path AS photo_path
+            ORDER BY photo.path
+            """,
+            id=person_id
+        )
+        records = await result.data()
+        return [
+            {
+                "crop_path":  r["crop_path"],
+                "face_index": r["face_index"],
+                "photo_path": r["photo_path"],
+            }
+            for r in records
+        ]
+
+
+@router.get("/{person_id}/photos")
+async def get_photos(person_id: str):
+    async with get_session() as session:
+        result = await session.run(
+            """
+            MATCH (p:Person {id: $id})-[:APPEARS_IN]->(photo:Photo)
+            RETURN DISTINCT photo.path AS photo_path
+            ORDER BY photo.path
+            """,
+            id=person_id
+        )
+        records = await result.data()
+        return [r["photo_path"] for r in records]
 
 
 @router.get("/{person_id}/relatives")

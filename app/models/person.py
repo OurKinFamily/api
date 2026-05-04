@@ -30,3 +30,4 @@ class Person(BaseModel):
     death_place: Optional[str] = None
     is_living: bool = True
     notes: Optional[str] = None
+    avatar: Optional[str] = None
