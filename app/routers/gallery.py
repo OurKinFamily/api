@@ -126,6 +126,11 @@ async def media_detail(path: str = Query(...)):
         loc_block   = meta.get("location", {})
         primary_loc = loc_block.get("primary") or {}
         geoloc      = loc_block.get("geolocation") or {}
+        landmarks   = loc_block.get("landmarks") or []
+        top_landmark = next(
+            (l for l in landmarks if l.get("confidence", 0) >= 0.8),
+            None
+        )
         camera      = meta.get("camera", {})
         expos       = meta.get("settings", {})
         proc        = meta.get("processing", {})
@@ -153,12 +158,16 @@ async def media_detail(path: str = Query(...)):
                 "confidence": ts.get("confidence"),
             },
             "location": {
-                "latitude":  primary_loc.get("latitude"),
-                "longitude": primary_loc.get("longitude"),
-                "source":    primary_loc.get("source"),
-                "city":      geoloc.get("city"),
-                "state":     geoloc.get("state_code"),
-                "county":    geoloc.get("county_name"),
+                "latitude":             primary_loc.get("latitude"),
+                "longitude":            primary_loc.get("longitude"),
+                "source":               primary_loc.get("source"),
+                "city":                 geoloc.get("city"),
+                "state":                geoloc.get("state_code"),
+                "county":               geoloc.get("county_name"),
+                "city_confidence":      geoloc.get("confidence"),
+                "landmark":             top_landmark["landmark"]["name"] if top_landmark else None,
+                "landmark_category":    top_landmark["landmark"]["category"] if top_landmark else None,
+                "landmark_distance_m":  top_landmark["distance"] if top_landmark else None,
             } if primary_loc.get("latitude") else None,
             "camera": {
                 "make":  camera.get("make"),
