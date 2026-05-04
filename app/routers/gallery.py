@@ -87,7 +87,7 @@ async def list_media(
         photos.append({
             "path":           path,
             "url":            f"/api/media/{path}",
-            "thumbnail_url":  f"/api/media/thumb/{path}",
+            "thumbnail_url":  f"/api/media/thumb/{path.removeprefix('archive/')}",
             "filename":       p.get("filename") or Path(path).name,
             "timestamp":      p.get("timestamp"),
             "confidence":     p.get("timestamp_confidence"),
