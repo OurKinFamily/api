@@ -93,6 +93,8 @@ async def list_media(
             "confidence":     p.get("timestamp_confidence"),
             "dominant_color": p.get("dominant_color"),
             "is_video":       p.get("is_video", False),
+            "width":          p.get("width"),
+            "height":         p.get("height"),
         })
 
     return {
