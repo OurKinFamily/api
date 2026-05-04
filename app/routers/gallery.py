@@ -8,10 +8,9 @@ capture date for the vast majority of photos. The 0000/ directory
 
 import json
 import logging
-from functools import lru_cache
 from pathlib import Path
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from app.config import settings
 
 log = logging.getLogger(__name__)
@@ -109,6 +108,85 @@ async def list_media(
         "offset":   offset,
         "has_more": offset + limit < total,
     }
+
+
+@router.get("/detail")
+async def media_detail(path: str = Query(...)):
+    full_path = settings.photos_root / path
+    if not full_path.exists():
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    sidecar = Path(str(full_path) + ".json")
+    base = {"path": path, "filename": full_path.name}
+    if not sidecar.exists():
+        return base
+
+    try:
+        data    = json.loads(sidecar.read_text())
+        results = data.get("results") or []
+        meta    = results[0].get("metadata", {}) if results else data.get("metadata", {})
+
+        file_m   = meta.get("file", {})
+        media    = meta.get("media", {})
+        dims     = media.get("dimensions", {})
+        ts       = meta.get("timestamps", {}).get("primary", {})
+        loc_block = meta.get("location", {})
+        primary_loc = loc_block.get("primary") or {}
+        geoloc   = loc_block.get("geolocation") or {}
+        camera   = meta.get("camera", {})
+        expos    = meta.get("settings", {})
+        proc     = meta.get("processing", {})
+
+        return {
+            **base,
+            "file": {
+                "size":     file_m.get("size"),
+                "mimeType": file_m.get("mimeType"),
+            },
+            "media": {
+                "type":        media.get("type"),
+                "format":      media.get("format"),
+                "width":       dims.get("width"),
+                "height":      dims.get("height"),
+                "megapixels":  dims.get("megapixels"),
+                "orientation": dims.get("orientation"),
+                "dominantColor": media.get("dominantColor"),
+                "meanColor":     media.get("meanColor"),
+                "salientColor":  media.get("salientColor"),
+            },
+            "timestamp": {
+                "value":      ts.get("timestamp"),
+                "source":     ts.get("source"),
+                "confidence": ts.get("confidence"),
+            },
+            "location": {
+                "latitude":  primary_loc.get("latitude"),
+                "longitude": primary_loc.get("longitude"),
+                "source":    primary_loc.get("source"),
+                "city":      geoloc.get("city"),
+                "state":     geoloc.get("state_code"),
+                "county":    geoloc.get("county_name"),
+            } if primary_loc.get("latitude") else None,
+            "camera": {
+                "make":   camera.get("make"),
+                "model":  camera.get("model"),
+                "lens":   camera.get("lens"),
+            } if camera else None,
+            "settings": {
+                "iso":         expos.get("iso"),
+                "aperture":    expos.get("aperture"),
+                "shutterSpeed": expos.get("shutterSpeed"),
+                "focalLength": expos.get("focalLength"),
+                "flash":       expos.get("flash"),
+            } if expos else None,
+            "processing": {
+                "processor":   proc.get("processor"),
+                "extractedAt": proc.get("extractedAt"),
+            },
+        }
+    except Exception as e:
+        log.warning(f"Failed to parse sidecar for {path}: {e}")
+        return base
 
 
 @router.post("/reindex")
