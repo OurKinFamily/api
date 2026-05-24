@@ -26,8 +26,11 @@ JOBS_DATA_DIR = Path(os.environ.get("JOBS_DATA_DIR", "/photos/__data/workers"))
 RUNS_DIR      = JOBS_DATA_DIR / "runs"
 LOGS_DIR      = JOBS_DATA_DIR / "logs"
 
-RUNS_DIR.mkdir(parents=True, exist_ok=True)
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+except PermissionError:
+    pass
 
 active_processes: dict[str, subprocess.Popen] = {}
 
