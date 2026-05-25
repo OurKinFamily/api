@@ -88,19 +88,12 @@ def _collection_record(rec: dict) -> dict:
 @router.get("/people/{person_id}/collections")
 async def get_collections(person_id: str):
     async with get_session() as session:
+        # A person's scrapbook shows the collections they OWN (grouped),
+        # with a live item count. Items they merely appear in are surfaced
+        # individually via /people/{id}/items, not as grouped collections.
         result = await session.run(
             """
-            MATCH (p:Person {id: $id})
-            CALL {
-              WITH p
-              MATCH (c:Collection)-[:BELONGS_TO]->(p)
-              RETURN c
-              UNION
-              WITH p
-              MATCH (p)-[:APPEARS_IN]->(:Media)<-[:CONTAINS]-(c:Collection)
-              RETURN c
-            }
-            WITH DISTINCT c
+            MATCH (c:Collection)-[:BELONGS_TO]->(p:Person {id: $id})
             OPTIONAL MATCH (c)-[:CONTAINS]->(m:Media)
             RETURN c, count(m) AS item_count ORDER BY c.name
             """,
@@ -108,6 +101,29 @@ async def get_collections(person_id: str):
         )
         records = await result.data()
         return [_collection_record(r) for r in records]
+
+
+@router.get("/people/{person_id}/items")
+async def get_person_items(person_id: str):
+    """Individual heritage items a person appears in, from collections they do
+    NOT own (those are shown grouped). Each is its own scrapbook entry."""
+    async with get_session() as session:
+        result = await session.run(
+            """
+            MATCH (p:Person {id: $id})-[:APPEARS_IN]->(m:Media)<-[:CONTAINS]-(c:Collection)
+            WHERE NOT (c)-[:BELONGS_TO]->(p)
+            RETURN DISTINCT m, head(collect(c.name)) AS collection_name
+            ORDER BY m.content_date, m.filename
+            """,
+            id=person_id,
+        )
+        rows = await result.data()
+    items = []
+    for r in rows:
+        it = _item_from_node(dict(r["m"]))
+        it["collection_name"] = r["collection_name"]
+        items.append(it)
+    return {"items": items, "total": len(items)}
 
 
 @router.post("/people/{person_id}/collections", status_code=201)
