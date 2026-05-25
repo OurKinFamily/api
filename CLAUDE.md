@@ -85,16 +85,32 @@ OR heritage.context.type == "family"      # mpp-tagged
 ### Key Relationships
 
 ```
-(Person)-[:APPEARS_IN]->(Media)
+(Person)-[:APPEARS_IN]->(Media)        # depicted/mentioned in a specific media item
 (Person)-[:PARENT_OF]->(Person)
 (Person)-[:MARRIED_TO]->(Person)
 (Person)-[:KNOWS]->(Person)
 (Person)-[:MEMBER_OF]->(Group)
-(Collection)-[:BELONGS_TO]->(Person)
+(Collection)-[:BELONGS_TO]->(Person)   # collection ownership
+(Collection)-[:CONTAINS]->(Document)   # collection → its pages
 ```
+
+**Ownership vs appearance** — two distinct concepts:
+- `Collection-[:BELONGS_TO]->Person` = who owns the whole collection (e.g. Dorothy owns her address book)
+- `Person-[:APPEARS_IN]->Document` = who is on a *specific page* (e.g. Patricia's address written in it)
+
+### Documents — Source of Truth
+
+`:Media:Document` nodes are the source of truth for collection pages. The
+`/collections/{id}/items` endpoint reads from Document nodes (NOT from disk).
+Pages live on disk under `heritage/<person>/<collection>/`, but adding new
+pages requires re-running `import_documents.py` to pick them up.
+
+Import scripts (in photo-intelligence repo):
+- `import_documents.py` — creates Document nodes from collection sidecars
+- `tag_stephen_documents.py` — backfills people in untagged sidecars
+- `tag_heritage_nodes.py` — adds `:Heritage` to existing Media by sidecar signal
 
 ## Coming Next
 
 - `:Media:Video:Heritage` nodes for Old Reels + 1987 home videos
-- `:Media:Document` nodes for Collection items
 - Real auth middleware
