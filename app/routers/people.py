@@ -209,7 +209,7 @@ async def assign_face(person_id: str, body: FaceAssign):
         await session.run(
             """
             MATCH (person:Person {id: $person_id})
-            MATCH (photo:Photo {path: $photo_path})
+            MATCH (photo:Media {path: $photo_path})
             MERGE (person)-[r:APPEARS_IN]->(photo)
             SET r.face_index = $face_index,
                 r.crop_path  = $crop_path,
@@ -227,7 +227,7 @@ async def get_faces(person_id: str):
     async with get_session() as session:
         result = await session.run(
             """
-            MATCH (p:Person {id: $id})-[r:APPEARS_IN]->(photo:Photo)
+            MATCH (p:Person {id: $id})-[r:APPEARS_IN]->(photo:Media)
             RETURN r.crop_path AS crop_path,
                    r.face_index AS face_index,
                    photo.path AS photo_path
@@ -250,7 +250,7 @@ async def get_faces(person_id: str):
 async def get_photos(person_id: str, limit: int = 100, offset: int = 0):
     async with get_session() as session:
         count_result = await session.run(
-            "MATCH (p:Person {id: $id})-[:APPEARS_IN]->(photo:Photo) RETURN count(DISTINCT photo) AS n",
+            "MATCH (p:Person {id: $id})-[:APPEARS_IN]->(photo:Media) RETURN count(DISTINCT photo) AS n",
             id=person_id
         )
         count_rec = await count_result.single()
@@ -258,7 +258,7 @@ async def get_photos(person_id: str, limit: int = 100, offset: int = 0):
 
         result = await session.run(
             """
-            MATCH (p:Person {id: $id})-[:APPEARS_IN]->(photo:Photo)
+            MATCH (p:Person {id: $id})-[:APPEARS_IN]->(photo:Media)
             RETURN DISTINCT photo.path AS photo_path
             ORDER BY photo.path
             SKIP $skip LIMIT $lim
@@ -365,7 +365,7 @@ async def get_person_travel_points(person_id: str):
     async with get_session() as session:
         result = await session.run(
             """
-            MATCH (person:Person {id: $id})-[:APPEARS_IN]->(photo:Photo)
+            MATCH (person:Person {id: $id})-[:APPEARS_IN]->(photo:Media)
             WHERE photo.latitude IS NOT NULL AND photo.longitude IS NOT NULL
             RETURN photo.latitude AS lat, photo.longitude AS lng, photo.path AS path
             """,

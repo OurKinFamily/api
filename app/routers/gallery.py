@@ -52,17 +52,17 @@ async def list_media(
         params["ts_to"] = f"{year_to + 1}-01-01"
 
     if media_type == "photo":
-        conditions.append("p.is_video = false")
+        conditions.append("p:Photo")
     elif media_type == "video":
-        conditions.append("p.is_video = true")
+        conditions.append("p:Video")
 
     ids = [i.strip() for i in person_ids.split(",") if i.strip()] if person_ids else []
     if ids:
         conditions.append("ALL(pid IN $person_ids WHERE EXISTS { (:Person {id: pid})-[:APPEARS_IN]->(p) })")
         params["person_ids"] = ids
-        match = "MATCH (p:Photo)"
+        match = "MATCH (p:Media)"
     else:
-        match = "MATCH (p:Photo)"
+        match = "MATCH (p:Media)"
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
@@ -123,7 +123,7 @@ async def media_detail(path: str = Query(...)):
         async with get_session() as session:
             result = await session.run(
                 """
-                MATCH (person:Person)-[rel:APPEARS_IN]->(p:Photo {path: $path})
+                MATCH (person:Person)-[rel:APPEARS_IN]->(p:Media {path: $path})
                 RETURN person.id AS id, person.name AS name,
                        person.known_as AS known_as, person.avatar AS avatar,
                        rel.face_index AS face_index, rel.crop_path AS crop_path

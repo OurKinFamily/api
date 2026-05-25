@@ -10,7 +10,7 @@ async def get_points():
     async with get_session() as session:
         result = await session.run(
             """
-            MATCH (p:Photo)
+            MATCH (p:Media)
             WHERE p.latitude IS NOT NULL AND p.longitude IS NOT NULL
             RETURN p.latitude AS lat, p.longitude AS lng, p.path AS path
             """
