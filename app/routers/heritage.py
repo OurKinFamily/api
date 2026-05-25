@@ -1,0 +1,206 @@
+import uuid
+import json
+from pathlib import Path
+from typing import Optional
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from app.db.neo4j import get_session
+from app.config import settings
+
+router = APIRouter(tags=["heritage"])
+
+PHOTOS_ROOT = settings.photos_root
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+COLLECTION_TYPES = {"baby_book", "photo_album", "yearbook", "medical_records",
+                    "newspaper", "school_papers", "certificates", "letters", "documents"}
+
+
+# ── Models ─────────────────────────────────────────────────────────────────────
+
+class CollectionCreate(BaseModel):
+    name: str
+    type: str
+    is_series: bool = False
+    base_path: str
+    cover_path: Optional[str] = None
+    description: Optional[str] = None
+
+
+class CollectionUpdate(BaseModel):
+    name: Optional[str] = None
+    type: Optional[str] = None
+    is_series: Optional[bool] = None
+    cover_path: Optional[str] = None
+    description: Optional[str] = None
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _read_sidecar(img: Path) -> dict:
+    sidecar = Path(str(img) + ".json")
+    if not sidecar.exists():
+        return {}
+    try:
+        d = json.load(open(sidecar))
+        results = d.get("results", [{}])
+        return results[0].get("metadata", {}) if results else {}
+    except Exception:
+        return {}
+
+
+def _read_txt(img: Path) -> Optional[str]:
+    txt = Path(str(img) + ".txt")
+    return txt.read_text(encoding="utf-8").strip() if txt.exists() else None
+
+
+def _item_from_file(img: Path, photos_root: Path) -> dict:
+    rel = str(img.relative_to(photos_root))
+    meta = _read_sidecar(img)
+    h = meta.get("heritage", {})
+    ctx = h.get("context") or {}
+    cd = h.get("contentDate") or {}
+
+    audio = h.get("audio")
+    audio_url = None
+    if audio and audio.get("file"):
+        audio_path = img.parent / audio["file"]
+        if audio_path.exists():
+            audio_rel = str(audio_path.relative_to(photos_root))
+            audio_url = f"/api/media/{audio_rel}"
+
+    return {
+        "path": rel,
+        "url": f"/api/media/{rel}",
+        "thumb_url": f"/api/media/thumb/{rel}",
+        "page_number": h.get("pageNumber"),
+        "transcription": _read_txt(img),
+        "content_date": cd.get("date"),
+        "content_date_precision": cd.get("precision"),
+        "context_type": ctx.get("type"),
+        "context_subject": ctx.get("subject") or ctx.get("event"),
+        "context_notes": ctx.get("notes"),
+        "description": (meta.get("heritage", {}).get("metadata") or {}).get("imageDescription"),
+        "audio_url": audio_url,
+        "audio_description": audio.get("description") if audio else None,
+    }
+
+
+def _collection_record(rec: dict) -> dict:
+    c = dict(rec["c"])
+    c["created_at"] = str(c.get("created_at", ""))
+    return c
+
+
+# ── Person collections ─────────────────────────────────────────────────────────
+
+@router.get("/people/{person_id}/collections")
+async def get_collections(person_id: str):
+    async with get_session() as session:
+        result = await session.run(
+            """
+            MATCH (c:Collection)-[:BELONGS_TO]->(p:Person {id: $id})
+            RETURN c ORDER BY c.name
+            """,
+            id=person_id,
+        )
+        records = await result.data()
+        return [_collection_record(r) for r in records]
+
+
+@router.post("/people/{person_id}/collections", status_code=201)
+async def create_collection(person_id: str, body: CollectionCreate):
+    cid = str(uuid.uuid4())
+    async with get_session() as session:
+        exists = await session.run("MATCH (p:Person {id: $id}) RETURN p", id=person_id)
+        if not await exists.single():
+            raise HTTPException(status_code=404, detail="Person not found")
+        await session.run(
+            """
+            CREATE (c:Collection {
+                id: $id, name: $name, type: $type, is_series: $is_series,
+                base_path: $base_path, cover_path: $cover_path,
+                description: $description, item_count: 0, created_at: datetime()
+            })
+            WITH c
+            MATCH (p:Person {id: $person_id})
+            CREATE (c)-[:BELONGS_TO]->(p)
+            """,
+            id=cid, person_id=person_id,
+            name=body.name, type=body.type, is_series=body.is_series,
+            base_path=body.base_path, cover_path=body.cover_path,
+            description=body.description,
+        )
+    return {"id": cid}
+
+
+# ── Single collection ──────────────────────────────────────────────────────────
+
+@router.get("/collections/{collection_id}")
+async def get_collection(collection_id: str):
+    async with get_session() as session:
+        result = await session.run(
+            """
+            MATCH (c:Collection {id: $id})-[:BELONGS_TO]->(p:Person)
+            RETURN c, p.id AS person_id, p.name AS person_name, p.known_as AS person_known_as
+            """,
+            id=collection_id,
+        )
+        rec = await result.single()
+        if not rec:
+            raise HTTPException(status_code=404, detail="Collection not found")
+        data = _collection_record({"c": rec["c"]})
+        data["person_id"] = rec["person_id"]
+        data["person_name"] = rec["person_known_as"] or rec["person_name"]
+        return data
+
+
+@router.patch("/collections/{collection_id}")
+async def update_collection(collection_id: str, body: CollectionUpdate):
+    async with get_session() as session:
+        result = await session.run(
+            "MATCH (c:Collection {id: $id}) RETURN c", id=collection_id
+        )
+        if not await result.single():
+            raise HTTPException(status_code=404, detail="Collection not found")
+        sets = []
+        params = {"id": collection_id}
+        for field in ("name", "type", "is_series", "cover_path", "description"):
+            val = getattr(body, field)
+            if val is not None:
+                sets.append(f"c.{field} = ${field}")
+                params[field] = val
+        if sets:
+            await session.run(
+                f"MATCH (c:Collection {{id: $id}}) SET {', '.join(sets)}", **params
+            )
+    return {"ok": True}
+
+
+@router.get("/collections/{collection_id}/items")
+async def get_collection_items(collection_id: str):
+    async with get_session() as session:
+        result = await session.run(
+            "MATCH (c:Collection {id: $id}) RETURN c.base_path AS base_path, c.is_series AS is_series",
+            id=collection_id,
+        )
+        rec = await result.single()
+        if not rec:
+            raise HTTPException(status_code=404, detail="Collection not found")
+
+    base_path = PHOTOS_ROOT / rec["base_path"]
+    is_series = rec["is_series"]
+
+    if not base_path.is_dir():
+        raise HTTPException(status_code=404, detail=f"Directory not found: {base_path}")
+
+    images = sorted(
+        [p for p in base_path.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    )
+
+    items = [_item_from_file(img, PHOTOS_ROOT) for img in images]
+
+    if is_series:
+        items.sort(key=lambda x: (x["page_number"] is None, x["page_number"] or 0))
+
+    return {"items": items, "total": len(items), "is_series": is_series}

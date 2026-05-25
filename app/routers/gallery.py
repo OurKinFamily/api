@@ -34,7 +34,7 @@ async def list_media(
     year_from:      Optional[int] = Query(default=None),
     year_to:        Optional[int] = Query(default=None),
     media_type:     str           = Query(default="all"),   # photo | video | all
-    person_id:      Optional[str] = Query(default=None),
+    person_ids:     Optional[str] = Query(default=None),    # comma-separated person IDs
 ):
     conditions = []
     params: dict = {"offset": offset, "limit": limit}
@@ -56,9 +56,11 @@ async def list_media(
     elif media_type == "video":
         conditions.append("p.is_video = true")
 
-    if person_id:
-        match = "MATCH (:Person {id: $person_id})-[:APPEARS_IN]->(p:Photo)"
-        params["person_id"] = person_id
+    ids = [i.strip() for i in person_ids.split(",") if i.strip()] if person_ids else []
+    if ids:
+        conditions.append("ALL(pid IN $person_ids WHERE EXISTS { (:Person {id: pid})-[:APPEARS_IN]->(p) })")
+        params["person_ids"] = ids
+        match = "MATCH (p:Photo)"
     else:
         match = "MATCH (p:Photo)"
 
@@ -113,8 +115,75 @@ async def media_detail(path: str = Query(...)):
 
     sidecar = Path(str(full_path) + ".json")
     base = {"path": path, "filename": full_path.name}
+
+    # Query Neo4j for people (with face_index + crop_path from relationship)
+    people = []
+    face_count = None
+    try:
+        async with get_session() as session:
+            result = await session.run(
+                """
+                MATCH (person:Person)-[rel:APPEARS_IN]->(p:Photo {path: $path})
+                RETURN person.id AS id, person.name AS name,
+                       person.known_as AS known_as, person.avatar AS avatar,
+                       rel.face_index AS face_index, rel.crop_path AS crop_path
+                ORDER BY person.name
+                """,
+                path=path,
+            )
+            people = await result.data()
+    except Exception as e:
+        log.warning(f"Neo4j people query failed for {path}: {e}")
+
+    # Read faces sidecar — face count + bbox lookup by face_index
+    unidentified = []
+    faces_sidecar = Path(str(full_path) + ".faces.json")
+    if faces_sidecar.exists():
+        try:
+            fd = json.loads(faces_sidecar.read_text())
+            face_count = fd.get("num_faces")
+            bbox_by_index = {f["face_index"]: f.get("bbox") for f in fd.get("faces", [])}
+            for p in people:
+                p["bbox"]     = bbox_by_index.get(p.get("face_index"))
+                p["crop_url"] = f"/api/media/{p['crop_path']}" if p.get("crop_path") else None
+
+            # Derive crop paths for faces not yet assigned to anyone
+            assigned_indexes = {p.get("face_index") for p in people}
+            parts = Path(path).parts  # ('archive', '2026', '04', 'file.jpg')
+            year, month, fname = parts[1], parts[2], parts[3]
+            for face in fd.get("faces", []):
+                fi = face["face_index"]
+                if fi in assigned_indexes:
+                    continue
+                crop_path = f"__faces/crops/{year}/{month}/{fname}_face{fi}.jpg"
+                crop_full = settings.photos_root / crop_path
+                if crop_full.exists():
+                    unidentified.append({
+                        "face_index": fi,
+                        "bbox":       face.get("bbox"),
+                        "crop_path":  crop_path,
+                        "crop_url":   f"/api/media/{crop_path}",
+                        "confidence": face.get("confidence"),
+                    })
+        except Exception as e:
+            log.warning(f"Failed to parse faces sidecar for {path}: {e}")
+
+    # Read objects sidecar for detected labels
+    objects = []
+    objects_sidecar = Path(str(full_path) + ".objects.json")
+    if objects_sidecar.exists():
+        try:
+            od = json.loads(objects_sidecar.read_text())
+            counts: dict[str, int] = {}
+            for det in od.get("detections", []):
+                name = det.get("class_name", "")
+                counts[name] = counts.get(name, 0) + 1
+            objects = [{"label": k, "count": v} for k, v in sorted(counts.items())]
+        except Exception:
+            pass
+
     if not sidecar.exists():
-        return base
+        return {**base, "people": people, "face_count": face_count, "unidentified": unidentified, "objects": objects}
 
     try:
         data    = json.loads(sidecar.read_text())
@@ -139,6 +208,10 @@ async def media_detail(path: str = Query(...)):
 
         return {
             **base,
+            "people":      people,
+            "face_count":  face_count,
+            "unidentified": unidentified,
+            "objects":     objects,
             "file": {
                 "size":     file_m.get("size"),
                 "mimeType": file_m.get("mimeType"),
@@ -190,4 +263,4 @@ async def media_detail(path: str = Query(...)):
         }
     except Exception as e:
         log.warning(f"Failed to parse sidecar for {path}: {e}")
-        return base
+        return {**base, "people": people, "face_count": face_count, "unidentified": unidentified, "objects": objects}

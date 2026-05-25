@@ -2,9 +2,9 @@
   {
     "id": "faces-extract",
     "name": "Face Detection",
-    "description": "Detect faces across the archive and write to DB",
+    "description": "Detect faces, write .faces.json sidecars",
     "color": "#8b5cf6",
-    "shell_command": "docker exec ourkin-worker-face python -m face extract {path}",
+    "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python extract_faces.py {path} {force}",
     "params": [
       {
         "name": "path",
@@ -12,31 +12,122 @@
         "type": "text",
         "default": "/photos/archive",
         "required": true,
-        "hint": "Path to scan for photos. The face worker will walk this directory recursively."
+        "hint": "Directory or single file to scan."
+      },
+      {
+        "name": "force",
+        "label": "Force re-run",
+        "type": "flag",
+        "flag": "--force",
+        "default": false,
+        "hint": "Re-extract even if sidecar already exists."
       }
     ]
   },
   {
     "id": "faces-cluster",
     "name": "Face Clustering",
-    "description": "Run DBSCAN on all face embeddings in the DB",
+    "description": "Run DBSCAN on .faces.json embeddings, write clusters.json",
     "color": "#6366f1",
-    "shell_command": "docker exec ourkin-worker-face python -m face cluster --eps {eps} --min-samples {min_samples}",
+    "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python cluster_faces.py --eps {eps} --min-samples {min_samples}",
     "params": [
       {
         "name": "eps",
         "label": "DBSCAN eps",
         "type": "text",
         "default": "0.4",
-        "hint": "Max cosine distance within a cluster (0.0–1.0). Lower = stricter. 0.4 is a good default."
+        "hint": "Max cosine distance within a cluster (0.0–1.0). Lower = stricter."
       },
       {
         "name": "min_samples",
         "label": "Min samples",
         "type": "text",
         "default": "3",
-        "hint": "Minimum faces to form a cluster. Higher = only frequent faces cluster."
+        "hint": "Minimum faces to form a cluster."
       }
     ]
+  },
+  {
+    "id": "objects-detect",
+    "name": "Object Detection",
+    "description": "Run YOLO on archive, write .objects.json sidecars",
+    "color": "#f59e0b",
+    "shell_command": "cd /home/stephen/photo-intelligence/services/object-detection && source venv/bin/activate && python detect_objects.py {path} --recursive {force}",
+    "params": [
+      {
+        "name": "path",
+        "label": "Target path",
+        "type": "text",
+        "default": "/photos/archive",
+        "required": true,
+        "hint": "Directory or single file to scan."
+      },
+      {
+        "name": "force",
+        "label": "Force re-run",
+        "type": "flag",
+        "flag": "--force",
+        "default": false,
+        "hint": "Re-detect even if sidecar already exists."
+      }
+    ]
+  },
+  {
+    "id": "clip-extract",
+    "name": "CLIP Embeddings",
+    "description": "Extract CLIP semantic embeddings, write .clip.json sidecars",
+    "color": "#06b6d4",
+    "shell_command": "cd /home/stephen/photo-intelligence/services/content-understanding && source venv/bin/activate && python extract_clip.py {path} --recursive {force}",
+    "params": [
+      {
+        "name": "path",
+        "label": "Target path",
+        "type": "text",
+        "default": "/photos/archive",
+        "required": true,
+        "hint": "Directory or single file to scan."
+      },
+      {
+        "name": "force",
+        "label": "Force re-run",
+        "type": "flag",
+        "flag": "--force",
+        "default": false,
+        "hint": "Re-extract even if sidecar already exists."
+      }
+    ]
+  },
+  {
+    "id": "scenes-extract",
+    "name": "Scene Embeddings",
+    "description": "Extract DINOv2 scene embeddings, write .scenes.json sidecars",
+    "color": "#10b981",
+    "shell_command": "cd /home/stephen/photo-intelligence/services/scene-recognition && source venv/bin/activate && python extract_scenes.py {path} --recursive {force}",
+    "params": [
+      {
+        "name": "path",
+        "label": "Target path",
+        "type": "text",
+        "default": "/photos/archive",
+        "required": true,
+        "hint": "Directory or single file to scan."
+      },
+      {
+        "name": "force",
+        "label": "Force re-run",
+        "type": "flag",
+        "flag": "--force",
+        "default": false,
+        "hint": "Re-extract even if sidecar already exists."
+      }
+    ]
+  },
+  {
+    "id": "archive-report",
+    "name": "Archive Report",
+    "description": "Scan archive metadata and regenerate report.json for Admin Overview",
+    "color": "#64748b",
+    "shell_command": "cd /home/stephen/photo-intelligence && python mm.py report -v -o /photos/__data/status/report.txt",
+    "params": []
   }
 ]
