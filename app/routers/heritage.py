@@ -78,6 +78,8 @@ def _item_from_node(d: dict) -> dict:
 def _collection_record(rec: dict) -> dict:
     c = dict(rec["c"])
     c["created_at"] = str(c.get("created_at", ""))
+    if "item_count" in rec:
+        c["item_count"] = rec["item_count"]
     return c
 
 
@@ -98,7 +100,9 @@ async def get_collections(person_id: str):
               MATCH (p)-[:APPEARS_IN]->(:Media)<-[:CONTAINS]-(c:Collection)
               RETURN c
             }
-            RETURN DISTINCT c ORDER BY c.name
+            WITH DISTINCT c
+            OPTIONAL MATCH (c)-[:CONTAINS]->(m:Media)
+            RETURN c, count(m) AS item_count ORDER BY c.name
             """,
             id=person_id,
         )
