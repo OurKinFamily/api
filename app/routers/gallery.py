@@ -100,7 +100,7 @@ async def list_media(
         })
 
     return {
-        "photos":   photos,
+        "media":    photos,
         "total":    total,
         "offset":   offset,
         "has_more": offset + limit < total,
