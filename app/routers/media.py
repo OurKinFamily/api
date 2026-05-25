@@ -12,7 +12,9 @@ THUMBS_ROOT = settings.photos_root / "__thumbs"
 
 @router.get("/thumb/{path:path}")
 async def serve_thumb(path: str):
-    thumb = (THUMBS_ROOT / (path + ".webp")).resolve()
+    # Photo paths in DB are "archive/YYYY/MM/..." but thumbs omit the "archive/" prefix
+    thumb_path = path.removeprefix("archive/")
+    thumb = (THUMBS_ROOT / (thumb_path + ".webp")).resolve()
     try:
         thumb.relative_to(THUMBS_ROOT.resolve())
     except ValueError:
