@@ -105,12 +105,46 @@ OR heritage.context.type == "family"      # mpp-tagged
 Pages live on disk under `heritage/<person>/<collection>/`, but adding new
 pages requires re-running `import_documents.py` to pick them up.
 
-Import scripts (in photo-intelligence repo):
+Import scripts (in `/home/stephen/photo-intelligence/`):
 - `import_documents.py` — creates Document nodes from collection sidecars
 - `tag_stephen_documents.py` — backfills people in untagged sidecars
 - `tag_heritage_nodes.py` — adds `:Heritage` to existing Media by sidecar signal
+- `patch_null_timestamps.py` — backfills timestamp/is_video from sidecars
+
+### Heritage Video Import (Old Reels / home movies)
+
+`import_heritage_videos.py` (in `/home/stephen/photo-intelligence/`) does the full flow:
+1. Archives `.mp4` + `.json` + `.poster.jpg` → `archive/YYYY/MM/` by `contentDate`
+2. Creates/merges a `:Collection {type:'home_movies'}` owned by Stephen E. Young
+3. Creates `:Media:Video:Heritage {source:'reel'}` nodes (title, notes, place, poster, gps, physical)
+4. Edges: `(collection)-[:CONTAINS]->(video)` + `(person)-[:APPEARS_IN]->(video)`
+
+Dry-run by default; `--execute` writes; `--only <substr>` limits to one file.
+People names in sidecars must be canonical DB names — `normalize_video_people.py`
+rewrites short names (e.g. "Dorothy" → "Dorothy Chooljian") in the sidecars first.
+
+Scrapbook shows a collection if the person **owns it OR appears in any contained media**
+(`get_collections` UNIONs both). So home-movie reels surface in every tagged person's
+scrapbook, not just the owner's.
+
+### Face Detection on Videos
+
+`services/face-recognition/extract_faces.py <path>` handles single files or dirs.
+Videos: `video_face_sidecar.py` samples 8 frames (10–90%), runs InsightFace, dedups
+across frames, writes the same `.faces.json` + `__faces/crops/` format as images.
+GPU (cu128 / RTX 5060 Ti) currently errors → falls back to CPU automatically (~9s/video).
+Detected faces are NOT auto-matched to the `APPEARS_IN` people — that's manual assignment.
+
+## Staging DB Access (dev)
+
+The data-rich DB is **ourkin staging** (`ourkin-graph-staging`):
+- Bolt: `bolt://localhost:7688`  ·  Browser: `http://localhost:7475`
+- Creds: `neo4j` / `Dalekini21!`
+- Local `api/.env` already points `NEO4J_URI` here.
+Prod (`ourkin-graph`, volume `deploy_neo4j_data`) has no host port — query via `docker exec`.
 
 ## Coming Next
 
-- `:Media:Video:Heritage` nodes for Old Reels + 1987 home videos
+- Batch remaining Old Reels (110) + 1987 videos (3) via `import_heritage_videos.py`
+- Manual face assignment / clustering for detected video faces
 - Real auth middleware
