@@ -119,7 +119,7 @@ async def _get_neo4j_assigned() -> set[tuple[str, int]]:
         return _neo4j_assigned
     async with get_session() as session:
         result = await session.run(
-            "MATCH ()-[r:APPEARS_IN]->(photo:Photo) WHERE r.face_index IS NOT NULL "
+            "MATCH ()-[r:APPEARS_IN]->(photo:Media) WHERE r.face_index IS NOT NULL "
             "RETURN photo.path AS pp, r.face_index AS fi"
         )
         rows = await result.data()
@@ -245,7 +245,7 @@ async def search_similar_faces_by_person(body: SearchByPersonBody):
     async with get_session() as session:
         result = await session.run(
             """
-            MATCH (p:Person {id: $person_id})-[r:APPEARS_IN]->(photo:Photo)
+            MATCH (p:Person {id: $person_id})-[r:APPEARS_IN]->(photo:Media)
             WHERE r.face_index IS NOT NULL
             RETURN photo.path AS photo_path, r.face_index AS face_index
             """,
@@ -310,7 +310,7 @@ async def _get_photo_meta(paths: list[str]) -> dict[str, dict]:
     async with get_session() as session:
         result = await session.run(
             """
-            MATCH (photo:Photo) WHERE photo.path IN $paths
+            MATCH (photo:Media) WHERE photo.path IN $paths
             RETURN photo.path AS path, photo.timestamp AS ts,
                    photo.latitude AS lat, photo.longitude AS lon
             """,
@@ -326,7 +326,7 @@ async def _get_cooccurrence(paths: list[str], connection_ids: set[str]) -> dict[
     async with get_session() as session:
         result = await session.run(
             """
-            MATCH (person:Person)-[:APPEARS_IN]->(photo:Photo)
+            MATCH (person:Person)-[:APPEARS_IN]->(photo:Media)
             WHERE photo.path IN $paths AND person.id IN $cids
             RETURN photo.path AS path, count(person) AS n
             """,
@@ -367,7 +367,7 @@ async def search_similar_faces_temporal(body: SearchByPersonTemporalBody):
     async with get_session() as session:
         result = await session.run(
             """
-            MATCH (p:Person {id: $person_id})-[r:APPEARS_IN]->(photo:Photo)
+            MATCH (p:Person {id: $person_id})-[r:APPEARS_IN]->(photo:Media)
             WHERE r.face_index IS NOT NULL
             RETURN photo.path AS photo_path, r.face_index AS face_index,
                    photo.timestamp AS ts
@@ -544,7 +544,7 @@ async def bulk_assign_faces(body: dict):
             await session.run(
                 """
                 MATCH (person:Person {id: $person_id})
-                MATCH (photo:Photo {path: $photo_path})
+                MATCH (photo:Media {path: $photo_path})
                 MERGE (person)-[r:APPEARS_IN]->(photo)
                 SET r.face_index = $face_index,
                     r.crop_path  = $crop_path,
@@ -728,7 +728,7 @@ def _sync_to_neo4j(person_id: str, faces: list):
                     """
                     UNWIND $batch AS row
                     MATCH (person:Person {id: $person_id})
-                    MATCH (photo:Photo {path: row.photo_path})
+                    MATCH (photo:Media {path: row.photo_path})
                     MERGE (person)-[r:APPEARS_IN]->(photo)
                     SET r.face_index = row.face_index,
                         r.crop_path  = row.crop_path,
