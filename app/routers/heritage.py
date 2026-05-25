@@ -50,11 +50,14 @@ def _item_from_node(d: dict) -> dict:
     else:
         thumb_url = f"/api/media/thumb/{path}"
 
+    subtitle_url = f"/api/media/vtt/{path}" if d.get("has_subtitles") else None
+
     return {
         "path": path,
         "url": f"/api/media/{path}",
         "thumb_url": thumb_url,
         "is_video": is_video,
+        "subtitle_url": subtitle_url,
         "page_number": d.get("page_number"),
         "transcription": d.get("transcription"),
         "content_date": d.get("content_date"),
