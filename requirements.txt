@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 neo4j
 pydantic-settings
+numpy
