@@ -37,7 +37,7 @@ async def _upsert(session, *, type, person_id, target_id, reason, confidence, me
 async def _group_membership_photo(session):
     """≥ half of a photo's people are in group X → suggest the rest."""
     result = await session.run("""
-        MATCH (photo:Photo)<-[:APPEARS_IN]-(person:Person)
+        MATCH (photo:Media)<-[:APPEARS_IN]-(person:Person)
         WITH photo, collect(DISTINCT person) AS photo_people, count(DISTINCT person) AS photo_count
         WHERE photo_count >= 3
         MATCH (photo)<-[:APPEARS_IN]-(member:Person)-[:MEMBER_OF]->(g:Group)
@@ -71,7 +71,7 @@ async def _group_membership_photo(session):
 async def _relationship_name_photos(session):
     """Same last name + appear in same photos → suggest family relationship."""
     result = await session.run("""
-        MATCH (a:Person)-[:APPEARS_IN]->(photo:Photo)<-[:APPEARS_IN]-(b:Person)
+        MATCH (a:Person)-[:APPEARS_IN]->(photo:Media)<-[:APPEARS_IN]-(b:Person)
         WHERE a.id < b.id
           AND a.name IS NOT NULL AND b.name IS NOT NULL
           AND size(split(a.name, ' ')) > 1
@@ -146,7 +146,7 @@ async def _connection_shared_group(session):
 async def _connection_photos(session):
     """≥ 10 shared photos, no KNOWS edge."""
     result = await session.run("""
-        MATCH (a:Person)-[:APPEARS_IN]->(photo:Photo)<-[:APPEARS_IN]-(b:Person)
+        MATCH (a:Person)-[:APPEARS_IN]->(photo:Media)<-[:APPEARS_IN]-(b:Person)
         WHERE a.id < b.id
           AND NOT (a)-[:KNOWS]-(b)
           AND NOT (a)-[:PARENT_OF*]-(b)
