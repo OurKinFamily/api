@@ -36,16 +36,25 @@ class CollectionUpdate(BaseModel):
 def _item_from_node(d: dict) -> dict:
     path = d["path"]
 
+    is_video = bool(d.get("is_video"))
+
     audio_url = None
     if d.get("audio_file"):
         audio_rel = f"{Path(path).parent}/{d['audio_file']}"
         if (PHOTOS_ROOT / audio_rel).exists():
             audio_url = f"/api/media/{audio_rel}"
 
+    # videos use their poster jpg as the thumbnail; images use the webp thumb route
+    if is_video and d.get("poster_path"):
+        thumb_url = f"/api/media/{d['poster_path']}"
+    else:
+        thumb_url = f"/api/media/thumb/{path}"
+
     return {
         "path": path,
         "url": f"/api/media/{path}",
-        "thumb_url": f"/api/media/thumb/{path}",
+        "thumb_url": thumb_url,
+        "is_video": is_video,
         "page_number": d.get("page_number"),
         "transcription": d.get("transcription"),
         "content_date": d.get("content_date"),
@@ -72,8 +81,17 @@ async def get_collections(person_id: str):
     async with get_session() as session:
         result = await session.run(
             """
-            MATCH (c:Collection)-[:BELONGS_TO]->(p:Person {id: $id})
-            RETURN c ORDER BY c.name
+            MATCH (p:Person {id: $id})
+            CALL {
+              WITH p
+              MATCH (c:Collection)-[:BELONGS_TO]->(p)
+              RETURN c
+              UNION
+              WITH p
+              MATCH (p)-[:APPEARS_IN]->(:Media)<-[:CONTAINS]-(c:Collection)
+              RETURN c
+            }
+            RETURN DISTINCT c ORDER BY c.name
             """,
             id=person_id,
         )
@@ -163,7 +181,7 @@ async def get_collection_items(collection_id: str):
         is_series = rec["is_series"]
 
         docs_result = await session.run(
-            "MATCH (c:Collection {id: $id})-[:CONTAINS]->(d:Document) RETURN d",
+            "MATCH (c:Collection {id: $id})-[:CONTAINS]->(d:Media) RETURN d",
             id=collection_id,
         )
         docs = [dict(r["d"]) for r in await docs_result.data()]

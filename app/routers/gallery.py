@@ -86,10 +86,16 @@ async def list_media(
     for r in records:
         p    = r["p"]
         path = p.get("path", "")
+        # heritage videos carry a poster jpg; regular media use the webp thumb route
+        poster = p.get("poster_path")
+        thumbnail_url = (
+            f"/api/media/{poster}" if poster
+            else f"/api/media/thumb/{path.removeprefix('archive/')}"
+        )
         photos.append({
             "path":           path,
             "url":            f"/api/media/{path}",
-            "thumbnail_url":  f"/api/media/thumb/{path.removeprefix('archive/')}",
+            "thumbnail_url":  thumbnail_url,
             "filename":       p.get("filename") or Path(path).name,
             "timestamp":      p.get("timestamp"),
             "confidence":     p.get("timestamp_confidence"),
