@@ -228,6 +228,7 @@ async def get_faces(person_id: str):
         result = await session.run(
             """
             MATCH (p:Person {id: $id})-[r:APPEARS_IN]->(photo:Media)
+            WHERE r.crop_path IS NOT NULL AND r.crop_path <> ''
             RETURN r.crop_path AS crop_path,
                    r.face_index AS face_index,
                    photo.path AS photo_path
