@@ -1,5 +1,4 @@
 import uuid
-import json
 from pathlib import Path
 from typing import Optional
 from fastapi import APIRouter, HTTPException
@@ -11,9 +10,6 @@ from app.config import settings
 router = APIRouter(tags=["heritage"])
 
 PHOTOS_ROOT = settings.photos_root
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
-COLLECTION_TYPES = {"baby_book", "photo_album", "yearbook", "medical_records",
-                    "newspaper", "school_papers", "certificates", "letters", "documents"}
 
 
 # ── Models ─────────────────────────────────────────────────────────────────────
@@ -37,52 +33,29 @@ class CollectionUpdate(BaseModel):
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _read_sidecar(img: Path) -> dict:
-    sidecar = Path(str(img) + ".json")
-    if not sidecar.exists():
-        return {}
-    try:
-        d = json.load(open(sidecar))
-        results = d.get("results", [{}])
-        return results[0].get("metadata", {}) if results else {}
-    except Exception:
-        return {}
+def _item_from_node(d: dict) -> dict:
+    path = d["path"]
 
-
-def _read_txt(img: Path) -> Optional[str]:
-    txt = Path(str(img) + ".txt")
-    return txt.read_text(encoding="utf-8").strip() if txt.exists() else None
-
-
-def _item_from_file(img: Path, photos_root: Path) -> dict:
-    rel = str(img.relative_to(photos_root))
-    meta = _read_sidecar(img)
-    h = meta.get("heritage", {})
-    ctx = h.get("context") or {}
-    cd = h.get("contentDate") or {}
-
-    audio = h.get("audio")
     audio_url = None
-    if audio and audio.get("file"):
-        audio_path = img.parent / audio["file"]
-        if audio_path.exists():
-            audio_rel = str(audio_path.relative_to(photos_root))
+    if d.get("audio_file"):
+        audio_rel = f"{Path(path).parent}/{d['audio_file']}"
+        if (PHOTOS_ROOT / audio_rel).exists():
             audio_url = f"/api/media/{audio_rel}"
 
     return {
-        "path": rel,
-        "url": f"/api/media/{rel}",
-        "thumb_url": f"/api/media/thumb/{rel}",
-        "page_number": h.get("pageNumber"),
-        "transcription": _read_txt(img),
-        "content_date": cd.get("date"),
-        "content_date_precision": cd.get("precision"),
-        "context_type": ctx.get("type"),
-        "context_subject": ctx.get("subject") or ctx.get("event"),
-        "context_notes": ctx.get("notes"),
-        "description": (meta.get("heritage", {}).get("metadata") or {}).get("imageDescription"),
+        "path": path,
+        "url": f"/api/media/{path}",
+        "thumb_url": f"/api/media/thumb/{path}",
+        "page_number": d.get("page_number"),
+        "transcription": d.get("transcription"),
+        "content_date": d.get("content_date"),
+        "content_date_precision": d.get("content_date_precision"),
+        "context_type": d.get("context_type"),
+        "context_subject": d.get("title"),
+        "context_notes": d.get("notes"),
+        "description": d.get("description"),
         "audio_url": audio_url,
-        "audio_description": audio.get("description") if audio else None,
+        "audio_description": d.get("audio_description"),
     }
 
 
@@ -181,26 +154,25 @@ async def update_collection(collection_id: str, body: CollectionUpdate):
 async def get_collection_items(collection_id: str):
     async with get_session() as session:
         result = await session.run(
-            "MATCH (c:Collection {id: $id}) RETURN c.base_path AS base_path, c.is_series AS is_series",
+            "MATCH (c:Collection {id: $id}) RETURN c.is_series AS is_series",
             id=collection_id,
         )
         rec = await result.single()
         if not rec:
             raise HTTPException(status_code=404, detail="Collection not found")
+        is_series = rec["is_series"]
 
-    base_path = PHOTOS_ROOT / rec["base_path"]
-    is_series = rec["is_series"]
+        docs_result = await session.run(
+            "MATCH (c:Collection {id: $id})-[:CONTAINS]->(d:Document) RETURN d",
+            id=collection_id,
+        )
+        docs = [dict(r["d"]) for r in await docs_result.data()]
 
-    if not base_path.is_dir():
-        raise HTTPException(status_code=404, detail=f"Directory not found: {base_path}")
-
-    images = sorted(
-        [p for p in base_path.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
-    )
-
-    items = [_item_from_file(img, PHOTOS_ROOT) for img in images]
+    items = [_item_from_node(d) for d in docs]
 
     if is_series:
         items.sort(key=lambda x: (x["page_number"] is None, x["page_number"] or 0))
+    else:
+        items.sort(key=lambda x: x["path"])
 
     return {"items": items, "total": len(items), "is_series": is_series}
