@@ -9,6 +9,8 @@ from app.config import settings
 router = APIRouter(prefix="/media", tags=["media"])
 
 THUMBS_ROOT = settings.photos_root / "__thumbs"
+MEDIUM_ROOT = settings.photos_root / "__medium"
+MEDIUM_MAX  = 1600  # longest edge in px
 
 
 def _srt_to_vtt(srt: str) -> str:
@@ -44,6 +46,38 @@ async def serve_vtt(path: str):
         raise HTTPException(status_code=404, detail="Subtitles not found")
     return Response(content=_srt_to_vtt(srt.read_text(encoding="utf-8")),
                     media_type="text/vtt")
+
+
+@router.get("/medium/{path:path}")
+async def serve_medium(path: str):
+    """Medium-res webp (longest edge MEDIUM_MAX). Generated on first request, cached on disk."""
+    src_rel = path.removeprefix("archive/")
+    cached = (MEDIUM_ROOT / (src_rel + ".webp")).resolve()
+    try:
+        cached.relative_to(MEDIUM_ROOT.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if cached.exists():
+        return FileResponse(cached, media_type="image/webp")
+
+    src = (settings.photos_root / path).resolve()
+    try:
+        src.relative_to(settings.photos_root.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not src.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    from PIL import Image, ImageOps
+    try:
+        img = Image.open(src)
+        img = ImageOps.exif_transpose(img)
+        img.thumbnail((MEDIUM_MAX, MEDIUM_MAX), Image.LANCZOS)
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        img.convert("RGB").save(cached, "WEBP", quality=85)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"resize failed: {e}")
+    return FileResponse(cached, media_type="image/webp")
 
 
 @router.get("/{path:path}")

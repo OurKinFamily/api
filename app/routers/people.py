@@ -203,6 +203,23 @@ class FaceAssign(BaseModel):
     face_index: int
     crop_path:  str
 
+class PhotoTag(BaseModel):
+    photo_path: str
+
+@router.post("/{person_id}/photos", status_code=204)
+async def tag_photo(person_id: str, body: PhotoTag):
+    """Tag a person in a photo with no face bbox (manual addition when face
+    extraction missed them). Creates APPEARS_IN without face_index/crop_path."""
+    async with get_session() as session:
+        await session.run(
+            """
+            MATCH (person:Person {id: $person_id})
+            MATCH (photo:Media {path: $photo_path})
+            MERGE (person)-[:APPEARS_IN]->(photo)
+            """,
+            person_id=person_id, photo_path=body.photo_path,
+        )
+
 @router.post("/{person_id}/faces", status_code=204)
 async def assign_face(person_id: str, body: FaceAssign):
     async with get_session() as session:

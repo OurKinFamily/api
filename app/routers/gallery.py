@@ -111,6 +111,8 @@ async def list_media(
             "is_video":       p.get("is_video", False),
             "width":          p.get("width"),
             "height":         p.get("height"),
+            "place_name":     p.get("place_name"),
+            "city":           p.get("city"),
         })
 
     return {
