@@ -9,7 +9,9 @@ from app.config import settings
 router = APIRouter(prefix="/media", tags=["media"])
 
 THUMBS_ROOT = settings.photos_root / "__thumbs"
-MEDIUM_ROOT = settings.photos_root / "__medium"
+# /photos is mounted read-only in container, so the medium cache lives in a
+# writable temp dir. Loses cache on container restart — acceptable.
+MEDIUM_ROOT = Path("/tmp/medium")
 MEDIUM_MAX  = 1600  # longest edge in px
 
 
