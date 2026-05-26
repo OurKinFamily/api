@@ -33,8 +33,11 @@ async def list_media(
     min_confidence: str           = Query(default="high"),
     year_from:      Optional[int] = Query(default=None),
     year_to:        Optional[int] = Query(default=None),
-    media_type:     str           = Query(default="all"),   # photo | video | all
-    person_ids:     Optional[str] = Query(default=None),    # comma-separated person IDs
+    ts_from:        Optional[str] = Query(default=None),       # ISO timestamp, takes precedence over year_from
+    ts_to:          Optional[str] = Query(default=None),       # ISO timestamp, takes precedence over year_to
+    sort:           str           = Query(default="desc"),     # desc | asc
+    media_type:     str           = Query(default="all"),      # photo | video | all
+    person_ids:     Optional[str] = Query(default=None),       # comma-separated person IDs
 ):
     conditions = []
     params: dict = {"offset": offset, "limit": limit}
@@ -43,13 +46,17 @@ async def list_media(
         conditions.append("p.timestamp_confidence IN $conf_values")
         params["conf_values"] = CONFIDENCE_SETS[min_confidence]
 
-    if year_from is not None:
-        conditions.append("p.timestamp >= $ts_from")
-        params["ts_from"] = f"{year_from}-01-01"
+    # ts_from / ts_to (ISO timestamps) override year_from / year_to when present.
+    effective_from = ts_from or (f"{year_from}-01-01" if year_from is not None else None)
+    effective_to   = ts_to   or (f"{year_to + 1}-01-01" if year_to is not None else None)
 
-    if year_to is not None:
+    if effective_from is not None:
+        conditions.append("p.timestamp >= $ts_from")
+        params["ts_from"] = effective_from
+
+    if effective_to is not None:
         conditions.append("p.timestamp < $ts_to")
-        params["ts_to"] = f"{year_to + 1}-01-01"
+        params["ts_to"] = effective_to
 
     if media_type == "photo":
         conditions.append("p:Photo")
@@ -66,11 +73,12 @@ async def list_media(
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
+    order = "ASC" if sort == "asc" else "DESC"
     count_q = f"{match} {where} RETURN count(p) AS total"
     data_q  = f"""
         {match} {where}
         RETURN p
-        ORDER BY p.timestamp DESC, p.path DESC
+        ORDER BY p.timestamp {order}, p.path {order}
         SKIP $offset LIMIT $limit
     """
 
@@ -111,6 +119,23 @@ async def list_media(
         "offset":   offset,
         "has_more": offset + limit < total,
     }
+
+
+@router.get("/years")
+async def list_years(min_confidence: str = Query(default="high")):
+    """Distinct years that have media, with counts. Used by the date scrubber."""
+    conf = CONFIDENCE_SETS.get(min_confidence, CONFIDENCE_SETS["high"])
+    q = """
+        MATCH (p:Media)
+        WHERE p.timestamp_confidence IN $conf AND p.timestamp IS NOT NULL
+        WITH substring(toString(p.timestamp), 0, 4) AS year
+        RETURN year, count(*) AS count
+        ORDER BY year DESC
+    """
+    async with get_session() as session:
+        res = await session.run(q, conf=conf)
+        rows = await res.data()
+    return [{"year": int(r["year"]), "count": r["count"]} for r in rows if r["year"].isdigit()]
 
 
 @router.get("/detail")
