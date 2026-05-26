@@ -4,6 +4,7 @@
     "name": "Face Detection",
     "description": "Detect faces, write .faces.json sidecars",
     "color": "#8b5cf6",
+    "whenToRun": "Run after adding new photos to /photos/archive. Step 1 of the face pipeline. Fast on small paths — limit to a year/month dir for incremental work. Use --force only to redo existing sidecars.",
     "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python extract_faces.py {path} {force}",
     "params": [
       {
@@ -29,6 +30,7 @@
     "name": "Face Clustering",
     "description": "Run DBSCAN on .faces.json embeddings, write clusters.json",
     "color": "#6366f1",
+    "whenToRun": "Step 3 of the face pipeline. Run after Face Detection adds significant new faces. Reads all sidecars and rewrites clusters.json. Safe to re-run — assigned and skipped faces stay tracked in Neo4j and are filtered out of the unassigned view automatically.",
     "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python cluster_faces.py --eps {eps} --min-samples {min_samples}",
     "params": [
       {
@@ -52,6 +54,7 @@
     "name": "Build Face Index",
     "description": "Read all .faces.json sidecars, write embeddings.npy + faces_meta.json for similarity search",
     "color": "#a78bfa",
+    "whenToRun": "Step 2 of the face pipeline. Run after Face Detection (and before Clustering, if you want similarity search to find newly added faces). Always rebuilds the whole index — takes a few minutes on a full archive.",
     "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python build_embedding_index.py",
     "params": []
   },
@@ -60,6 +63,7 @@
     "name": "Object Detection",
     "description": "Run YOLO on archive, write .objects.json sidecars",
     "color": "#f59e0b",
+    "whenToRun": "Run after adding new photos to /photos/archive. Independent of the face pipeline. Limit path scope for incremental runs.",
     "shell_command": "cd /home/stephen/photo-intelligence/services/object-detection && source venv/bin/activate && python detect_objects.py {path} --recursive {force}",
     "params": [
       {
@@ -85,6 +89,7 @@
     "name": "CLIP Embeddings",
     "description": "Extract CLIP semantic embeddings, write .clip.json sidecars",
     "color": "#06b6d4",
+    "whenToRun": "Run after adding new photos. Powers natural-language image search. Independent of other pipelines.",
     "shell_command": "cd /home/stephen/photo-intelligence/services/content-understanding && source venv/bin/activate && python extract_clip.py {path} --recursive {force}",
     "params": [
       {
@@ -110,6 +115,7 @@
     "name": "Scene Embeddings",
     "description": "Extract DINOv2 scene embeddings, write .scenes.json sidecars",
     "color": "#10b981",
+    "whenToRun": "Run after adding new photos. Used for visual-similarity search (\"more like this\"). Independent of other pipelines.",
     "shell_command": "cd /home/stephen/photo-intelligence/services/scene-recognition && source venv/bin/activate && python extract_scenes.py {path} --recursive {force}",
     "params": [
       {
@@ -135,6 +141,7 @@
     "name": "Archive Report",
     "description": "Scan archive metadata and regenerate report.json for Admin Overview",
     "color": "#64748b",
+    "whenToRun": "Run when the Admin Overview page numbers look stale (e.g. after a big import or after running other pipeline jobs). Takes a couple minutes; safe to run any time.",
     "shell_command": "cd /home/stephen/photo-intelligence && python mm.py report -v -o /photos/__data/status/report.txt",
     "params": []
   }
