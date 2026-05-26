@@ -182,6 +182,15 @@ async def remove_relationship(person_id: str, body: RelationshipRemove):
                 "MATCH (a:Person {id: $a})-[r:PARENT_OF]->(b:Person {id: $b}) DELETE r",
                 a=person_id, b=body.target_id,
             )
+        elif body.rel_type == "sibling":
+            await session.run(
+                """
+                MATCH (parent:Person)-[:PARENT_OF]->(focal:Person {id: $focal_id})
+                MATCH (parent)-[r:PARENT_OF]->(target:Person {id: $target_id})
+                DELETE r
+                """,
+                focal_id=person_id, target_id=body.target_id,
+            )
         else:
             raise HTTPException(400, f"Unknown rel_type: {body.rel_type}")
 

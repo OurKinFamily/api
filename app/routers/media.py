@@ -9,10 +9,13 @@ from app.config import settings
 router = APIRouter(prefix="/media", tags=["media"])
 
 THUMBS_ROOT = settings.photos_root / "__thumbs"
-# /photos is mounted read-only in container, so the medium cache lives in a
-# writable temp dir. Loses cache on container restart — acceptable.
+# /photos is mounted read-only in container, so on-demand caches live in
+# writable temp dirs. Lost on container restart — acceptable.
 MEDIUM_ROOT = Path("/tmp/medium")
 MEDIUM_MAX  = 1600  # longest edge in px
+THUMB_FALLBACK_ROOT = Path("/tmp/thumbs")
+THUMB_MAX = 400  # longest edge in px (matches mpp thumbnail size)
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif", ".tif", ".tiff", ".bmp"}
 
 
 def _srt_to_vtt(srt: str) -> str:
@@ -30,9 +33,49 @@ async def serve_thumb(path: str):
         thumb.relative_to(THUMBS_ROOT.resolve())
     except ValueError:
         raise HTTPException(status_code=403, detail="Forbidden")
-    if not thumb.exists():
-        raise HTTPException(status_code=404, detail="Thumbnail not found")
-    return FileResponse(thumb, media_type="image/webp")
+    if thumb.exists():
+        return FileResponse(thumb, media_type="image/webp")
+
+    # Resolve source under photos_root. Archive paths arrive with the
+    # "archive/" prefix stripped (gallery convention); other trees like
+    # "heritage/..." are passed through. Probe both.
+    candidates = [settings.photos_root / path]
+    if not path.startswith("archive/"):
+        candidates.append(settings.photos_root / "archive" / path)
+    src = next((c.resolve() for c in candidates if c.exists()), None)
+    if src is not None:
+        try:
+            src.relative_to(settings.photos_root.resolve())
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Fallback 1: videos use the sibling "<video>.poster.jpg".
+    if src is not None:
+        poster = src.parent / (src.name + ".poster.jpg")
+        if poster.exists():
+            return FileResponse(poster, media_type="image/jpeg")
+
+    # Fallback 2: image missing a webp thumb — generate on-demand, cache to /tmp.
+    if src is not None and src.suffix.lower() in IMAGE_EXTS:
+        cached = (THUMB_FALLBACK_ROOT / (thumb_path + ".webp")).resolve()
+        try:
+            cached.relative_to(THUMB_FALLBACK_ROOT.resolve())
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        if cached.exists():
+            return FileResponse(cached, media_type="image/webp")
+        from PIL import Image, ImageOps
+        try:
+            img = Image.open(src)
+            img = ImageOps.exif_transpose(img)
+            img.thumbnail((THUMB_MAX, THUMB_MAX), Image.LANCZOS)
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            img.convert("RGB").save(cached, "WEBP", quality=80)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"thumb gen failed: {e}")
+        return FileResponse(cached, media_type="image/webp")
+
+    raise HTTPException(status_code=404, detail="Thumbnail not found")
 
 
 @router.get("/vtt/{path:path}")
