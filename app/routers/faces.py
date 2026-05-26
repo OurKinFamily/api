@@ -647,6 +647,10 @@ async def get_cluster(cluster_id: str):
 
 class AssignBody(BaseModel):
     person_id: str
+    # Optional faces to exclude from this assignment, as [[photo_path, face_index], ...].
+    # Excluded faces are dropped from the Neo4j sync AND appended to SKIPPED_FACES_FILE
+    # so they don't reappear in the same cluster after reclustering.
+    exclude: list[list] | None = None
 
 
 @router.post("/clusters/{cluster_id}/assign", status_code=204)
@@ -660,8 +664,22 @@ async def assign_cluster(cluster_id: str, body: AssignBody):
     assignments[cluster_id] = body.person_id
     _save(ASSIGNMENTS_FILE, assignments)
 
-    # Write Neo4j APPEARS_IN in background
     faces = clusters[cluster_id]
+
+    # Filter excluded faces (UI lets the user deselect mismatches before assigning).
+    if body.exclude:
+        exclude_set = {(row[0], row[1]) for row in body.exclude if len(row) >= 2}
+        faces = [
+            f for f in faces
+            if (f.get("photo_path"), f.get("face_index")) not in exclude_set
+        ]
+        # Persist face-level skip so the excluded ones don't return in future reclustering.
+        existing    = {(row[0], row[1]) for row in _load(SKIPPED_FACES_FILE, [])}
+        new_entries = [list(k) for k in exclude_set if k not in existing and k[0]]
+        if new_entries:
+            _save(SKIPPED_FACES_FILE, _load(SKIPPED_FACES_FILE, []) + new_entries)
+
+    # Write Neo4j APPEARS_IN in background
     threading.Thread(
         target=_sync_to_neo4j,
         args=(body.person_id, faces),

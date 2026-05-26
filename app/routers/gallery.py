@@ -150,8 +150,10 @@ async def media_detail(path: str = Query(...)):
     base = {"path": path, "filename": full_path.name}
 
     # Query Neo4j for people (with face_index + crop_path from relationship)
+    # and the Media node itself (for heritage fields).
     people = []
     face_count = None
+    media_node = {}
     try:
         async with get_session() as session:
             result = await session.run(
@@ -165,8 +167,47 @@ async def media_detail(path: str = Query(...)):
                 path=path,
             )
             people = await result.data()
+
+            node_res = await session.run(
+                "MATCH (p:Media {path: $path}) RETURN p",
+                path=path,
+            )
+            node_rec = await node_res.single()
+            if node_rec:
+                media_node = dict(node_rec["p"])
     except Exception as e:
-        log.warning(f"Neo4j people query failed for {path}: {e}")
+        log.warning(f"Neo4j query failed for {path}: {e}")
+
+    # Heritage fields live on the Media node (set when the item was imported
+    # via mpp's heritage flags). Surface them so MediaDetail can render the
+    # same scrapbook context whether the user got here from the main gallery
+    # or from a collection.
+    audio_url = None
+    if media_node.get("audio_file"):
+        audio_rel = f"{Path(path).parent}/{media_node['audio_file']}"
+        if (settings.photos_root / audio_rel).exists():
+            audio_url = f"/api/media/{audio_rel}"
+    subtitle_url = f"/api/media/vtt/{path}" if media_node.get("has_subtitles") else None
+    heritage = {
+        "content_date":             media_node.get("content_date"),
+        "content_date_precision":   media_node.get("content_date_precision"),
+        "content_date_explanation": media_node.get("content_date_explanation"),
+        "context_type":             media_node.get("context_type"),
+        "context_subject":          media_node.get("title"),
+        "context_notes":            media_node.get("notes"),
+        "description":              media_node.get("description"),
+        "transcription":            media_node.get("transcription"),
+        "place_name":               media_node.get("place_name"),
+        "physical_status":          media_node.get("physical_status"),
+        "physical_condition":       media_node.get("physical_condition"),
+        "page_number":              media_node.get("page_number"),
+        "audio_url":                audio_url,
+        "audio_description":        media_node.get("audio_description"),
+        "subtitle_url":             subtitle_url,
+    }
+    # Drop empty so the frontend can check `if (detail.heritage)` cleanly.
+    if not any(v not in (None, "", []) for v in heritage.values()):
+        heritage = None
 
     # Read faces sidecar — face count + bbox lookup by face_index
     unidentified = []
@@ -216,7 +257,12 @@ async def media_detail(path: str = Query(...)):
             pass
 
     if not sidecar.exists():
-        return {**base, "people": people, "face_count": face_count, "unidentified": unidentified, "objects": objects}
+        return {
+            **base,
+            "people": people, "face_count": face_count,
+            "unidentified": unidentified, "objects": objects,
+            "heritage": heritage,
+        }
 
     try:
         data    = json.loads(sidecar.read_text())
@@ -245,6 +291,8 @@ async def media_detail(path: str = Query(...)):
             "face_count":  face_count,
             "unidentified": unidentified,
             "objects":     objects,
+            "heritage":    heritage,
+            "sidecar":     meta,
             "file": {
                 "size":     file_m.get("size"),
                 "mimeType": file_m.get("mimeType"),
@@ -296,4 +344,9 @@ async def media_detail(path: str = Query(...)):
         }
     except Exception as e:
         log.warning(f"Failed to parse sidecar for {path}: {e}")
-        return {**base, "people": people, "face_count": face_count, "unidentified": unidentified, "objects": objects}
+        return {
+            **base,
+            "people": people, "face_count": face_count,
+            "unidentified": unidentified, "objects": objects,
+            "heritage": heritage,
+        }
