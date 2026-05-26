@@ -35,8 +35,8 @@
         "name": "eps",
         "label": "DBSCAN eps",
         "type": "text",
-        "default": "0.4",
-        "hint": "Max cosine distance within a cluster (0.0–1.0). Lower = stricter."
+        "default": "0.3",
+        "hint": "Max cosine distance within a cluster (0.0–1.0). Lower = stricter. 0.3 is current production setting."
       },
       {
         "name": "min_samples",
@@ -46,6 +46,14 @@
         "hint": "Minimum faces to form a cluster."
       }
     ]
+  },
+  {
+    "id": "faces-index",
+    "name": "Build Face Index",
+    "description": "Read all .faces.json sidecars, write embeddings.npy + faces_meta.json for similarity search",
+    "color": "#a78bfa",
+    "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python build_embedding_index.py",
+    "params": []
   },
   {
     "id": "objects-detect",
