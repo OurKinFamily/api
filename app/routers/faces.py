@@ -19,10 +19,7 @@ router = APIRouter(prefix="/faces", tags=["faces"])
 
 CLUSTERS_DIR            = settings.photos_root / "__faces" / "clusters"
 CLUSTERS_FILE           = CLUSTERS_DIR / "clusters.json"
-ASSIGNMENTS_FILE        = CLUSTERS_DIR / "assignments.json"
 SKIPPED_FILE            = CLUSTERS_DIR / "skipped.json"
-SKIPPED_FACES_FILE      = CLUSTERS_DIR / "skipped_faces.json"
-INDIVIDUAL_ASSIGNS_FILE = CLUSTERS_DIR / "individual_assignments.json"  # [(photo_path, face_index), ...]
 EMBEDDINGS_NPY          = CLUSTERS_DIR / "embeddings.npy"
 FACES_META_FILE         = CLUSTERS_DIR / "faces_meta.json"
 
@@ -35,6 +32,10 @@ _emb_lookup: dict[tuple[str, int], int] | None = None  # (photo_path, face_index
 _neo4j_assigned: set[tuple[str, int]] | None = None
 _neo4j_assigned_ts: float = 0.0
 _NEO4J_ASSIGNED_TTL = 60.0  # seconds
+
+_neo4j_skipped: set[tuple[str, int]] | None = None
+_neo4j_skipped_ts: float = 0.0
+_NEO4J_SKIPPED_TTL = 60.0  # seconds
 _emb_lock     = threading.Lock()
 
 
@@ -132,6 +133,70 @@ async def _get_neo4j_assigned() -> set[tuple[str, int]]:
     return assigned
 
 
+async def _get_neo4j_skipped() -> set[tuple[str, int]]:
+    """All (photo_path, face_index) pairs marked as skipped in Neo4j (Media.skipped_faces). 60s cache."""
+    import time
+    global _neo4j_skipped, _neo4j_skipped_ts
+    if _neo4j_skipped is not None and (time.time() - _neo4j_skipped_ts) < _NEO4J_SKIPPED_TTL:
+        return _neo4j_skipped
+    async with get_session() as session:
+        result = await session.run(
+            "MATCH (m:Media) WHERE m.skipped_faces IS NOT NULL "
+            "RETURN m.path AS p, m.skipped_faces AS fis"
+        )
+        rows = await result.data()
+    skipped: set[tuple[str, int]] = set()
+    for row in rows:
+        p = row["p"].replace("/photos/", "", 1) if row["p"].startswith("/photos/") else row["p"]
+        for fi in (row["fis"] or []):
+            skipped.add((p, int(fi)))
+    _neo4j_skipped = skipped
+    _neo4j_skipped_ts = time.time()
+    return skipped
+
+
+async def _add_skipped_faces(items: list[tuple[str, int]]):
+    """Append (path, face_index) to Media.skipped_faces in Neo4j."""
+    by_media: dict[str, list[int]] = {}
+    for p, fi in items:
+        if not p or fi is None: continue
+        pp = p.replace("/photos/", "", 1) if p.startswith("/photos/") else p
+        by_media.setdefault(pp, []).append(int(fi))
+    if not by_media: return
+    async with get_session() as session:
+        await session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (m:Media {path: row.p})
+            SET m.skipped_faces = [x IN coalesce(m.skipped_faces, []) WHERE NOT x IN row.fis] + row.fis
+            """,
+            rows=[{"p": p, "fis": fis} for p, fis in by_media.items()],
+        )
+    global _neo4j_skipped
+    _neo4j_skipped = None
+
+
+async def _remove_skipped_faces(items: list[tuple[str, int]]):
+    """Remove (path, face_index) from Media.skipped_faces in Neo4j."""
+    by_media: dict[str, list[int]] = {}
+    for p, fi in items:
+        if not p or fi is None: continue
+        pp = p.replace("/photos/", "", 1) if p.startswith("/photos/") else p
+        by_media.setdefault(pp, []).append(int(fi))
+    if not by_media: return
+    async with get_session() as session:
+        await session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (m:Media {path: row.p})
+            SET m.skipped_faces = [x IN coalesce(m.skipped_faces, []) WHERE NOT x IN row.fis]
+            """,
+            rows=[{"p": p, "fis": fis} for p, fis in by_media.items()],
+        )
+    global _neo4j_skipped
+    _neo4j_skipped = None
+
+
 class SearchBody(BaseModel):
     photo_path: str
     face_index: int
@@ -145,28 +210,6 @@ class SearchByPersonBody(BaseModel):
     threshold: float = 0.5
     limit: int = 100000
     unassigned_only: bool = True
-
-
-def _build_assigned_face_set() -> set[tuple[str, int]]:
-    """Return set of (rel_photo_path, face_index) for all assigned faces (cluster + individual)."""
-    assigned: set[tuple[str, int]] = set()
-
-    # Cluster-level assignments
-    assignments = _load(ASSIGNMENTS_FILE, {})
-    if assignments:
-        clusters = _load(CLUSTERS_FILE, {})
-        for cid in assignments:
-            for f in clusters.get(cid, []):
-                pp = f.get("photo_path", "").replace("/photos/", "", 1)
-                fi = f.get("face_index")
-                if pp and fi is not None:
-                    assigned.add((pp, int(fi)))
-
-    # Individual assignments (from search/assign)
-    for row in _load(INDIVIDUAL_ASSIGNS_FILE, []):
-        assigned.add((row[0], int(row[1])))
-
-    return assigned
 
 
 def _run_similarity_search(matrix, meta, q, threshold, limit, assigned, exclude: set[tuple[str, int]]):
@@ -226,7 +269,7 @@ async def search_similar_faces(body: SearchBody):
     q = np.array(query_emb, dtype=np.float32)
     q /= np.linalg.norm(q) or 1.0
 
-    assigned = _build_assigned_face_set() if body.unassigned_only else set()
+    assigned = await _get_neo4j_assigned() if body.unassigned_only else set()
     exclude  = {(body.photo_path, body.face_index)}
     results  = _run_similarity_search(matrix, meta, q, body.threshold, body.limit, assigned, exclude)
     return {"results": results, "total": len(results)}
@@ -275,7 +318,7 @@ async def search_similar_faces_by_person(body: SearchByPersonBody):
     q = person_matrix.mean(axis=0).astype(np.float32)
     q /= np.linalg.norm(q) or 1.0
 
-    assigned = _build_assigned_face_set() if body.unassigned_only else set()
+    assigned = await _get_neo4j_assigned() if body.unassigned_only else set()
     # Exclude all of this person's already-tagged faces from results
     results  = _run_similarity_search(matrix, meta, q, body.threshold, body.limit, assigned, person_faces)
     return {"results": results, "total": len(results), "faces_used": len(row_indices)}
@@ -449,9 +492,7 @@ async def search_similar_faces_temporal(body: SearchByPersonTemporalBody):
         _get_neo4j_assigned() if body.unassigned_only else _empty_set(),
         _get_connection_ids(body.person_id),
     )
-    # Combine all exclusion sources: person's own faces + Neo4j APPEARS_IN + file-based cluster assignments
-    file_assigned = _build_assigned_face_set() if body.unassigned_only else set()
-    exclude = person_faces | file_assigned | (neo4j_assigned if body.unassigned_only else set())
+    exclude = person_faces | (neo4j_assigned if body.unassigned_only else set())
 
     # Search with each bucket mean, keep max similarity per face
     best: dict[tuple[str, int], dict] = {}
@@ -556,15 +597,6 @@ async def bulk_assign_faces(body: dict):
                 crop_path=crop_path,
             )
 
-    # Track individually assigned faces so similarity search excludes them
-    existing = {tuple(row) for row in _load(INDIVIDUAL_ASSIGNS_FILE, [])}
-    for f in faces:
-        pp = f.get("photo_path", "").replace("/photos/", "", 1)
-        fi = f.get("face_index")
-        if pp and fi is not None:
-            existing.add((pp, int(fi)))
-    _save(INDIVIDUAL_ASSIGNS_FILE, [list(row) for row in existing])
-
     # Invalidate Neo4j assigned-faces cache
     global _neo4j_assigned
     _neo4j_assigned = None
@@ -580,24 +612,96 @@ async def lookup_face_cluster(photo_path: str, face_index: int):
     cid = (_cluster_idx or {}).get((photo_path, face_index))
     if not cid:
         return {"cluster_id": None}
-    assignments = _load(ASSIGNMENTS_FILE, {})
     return {
         "cluster_id": cid,
         "size": _cluster_sizes.get(cid, 0),
-        "already_assigned": cid in assignments,
     }
 
 
 @router.get("/clusters")
 async def list_clusters(status: str = "unassigned", limit: int = 50, offset: int = 0):
-    clusters    = _load(CLUSTERS_FILE, {})
-    assignments = _load(ASSIGNMENTS_FILE, {})
-    skipped     = set(str(s) for s in _load(SKIPPED_FILE, []))
+    # Assigned view is sourced directly from Neo4j APPEARS_IN edges.
+    # Returns one row per Person, with the cluster_id set to
+    # `person:<uuid>` so the detail endpoint knows to fetch by person.
+    if status == "assigned":
+        async with get_session() as session:
+            tot_res = await session.run(
+                """
+                MATCH (p:Person)-[r:APPEARS_IN]->(:Media)
+                WHERE r.face_index IS NOT NULL
+                  AND r.crop_path IS NOT NULL AND r.crop_path <> ''
+                RETURN count(DISTINCT p) AS total
+                """
+            )
+            tot_row = await tot_res.single()
+            total   = tot_row["total"] if tot_row else 0
+
+            data_res = await session.run(
+                """
+                MATCH (p:Person)-[r:APPEARS_IN]->(:Media)
+                WHERE r.face_index IS NOT NULL
+                  AND r.crop_path IS NOT NULL AND r.crop_path <> ''
+                WITH p, count(r) AS face_count, collect(r.crop_path)[..4] AS sample_paths
+                ORDER BY face_count DESC, p.name ASC
+                SKIP $offset LIMIT $limit
+                RETURN p.id AS id, p.name AS name, p.known_as AS known_as, p.avatar AS avatar,
+                       face_count, sample_paths
+                """,
+                offset=offset, limit=limit,
+            )
+            rows = await data_res.data()
+
+        result = []
+        for r in rows:
+            samples = [_crop_url(cp) for cp in (r["sample_paths"] or []) if cp]
+            result.append({
+                "id":              f"person:{r['id']}",
+                "size":            r["face_count"],
+                "samples":         samples,
+                "person_id":       r["id"],
+                "person_name":     r["name"] or r["known_as"],
+                "person_known_as": r["known_as"] if r["known_as"] != r["name"] else None,
+                "person_avatar":   r["avatar"],
+            })
+        return {"clusters": result, "total": total, "offset": offset}
+
+    clusters = _load(CLUSTERS_FILE, {})
+    skipped  = set(str(s) for s in _load(SKIPPED_FILE, []))
 
     if status == "unassigned":
-        ids = [k for k in clusters if k not in assignments and k not in skipped and k != "-1"]
-    elif status == "assigned":
-        ids = [k for k in clusters if k in assignments and k != "-1"]
+        # Face-level "already done" set: Neo4j edges + face-level skips.
+        # We filter each cluster's faces by this so the user only sees work
+        # that's actually remaining.
+        done = await _get_neo4j_assigned()
+        done = set(done) | await _get_neo4j_skipped()
+
+        remaining_by_id = {}
+        for k, faces in clusters.items():
+            if k == "-1" or k in skipped: continue
+            rem = []
+            for f in faces:
+                pp = f.get("photo_path", "")
+                pp = pp.replace("/photos/", "", 1) if pp.startswith("/photos/") else pp
+                fi = f.get("face_index")
+                if pp and fi is not None and (pp, int(fi)) not in done:
+                    rem.append(f)
+            if rem:
+                remaining_by_id[k] = rem
+
+        ids = sorted(remaining_by_id.keys(), key=lambda k: len(remaining_by_id[k]), reverse=True)
+        total = len(ids)
+        page  = ids[offset:offset + limit]
+        result = []
+        for cid in page:
+            faces = remaining_by_id[cid]
+            samples = [_crop_url(f["crop_path"]) for f in faces[:SAMPLE_CROPS] if f.get("crop_path")]
+            result.append({
+                "id":          cid,
+                "size":        len(faces),
+                "samples":     samples,
+                "person_id":   None,
+            })
+        return {"clusters": result, "total": total, "offset": offset}
     else:
         ids = [k for k in clusters if k != "-1"]
 
@@ -607,28 +711,90 @@ async def list_clusters(status: str = "unassigned", limit: int = 50, offset: int
     ids   = ids[offset:offset + limit]
 
     result = []
+    person_ids_to_lookup = set()
     for cid in ids:
         faces = clusters[cid]
         samples = [_crop_url(f["crop_path"]) for f in faces[:SAMPLE_CROPS] if f.get("crop_path")]
+        pid = assignments.get(cid)
+        if pid:
+            person_ids_to_lookup.add(pid)
         result.append({
             "id":          cid,
             "size":        len(faces),
             "samples":     samples,
-            "person_id":   assignments.get(cid),
+            "person_id":   pid,
         })
+
+    # Enrich assigned clusters with the person's display name + avatar so the UI
+    # doesn't have to render UUIDs.
+    if person_ids_to_lookup:
+        people = {}
+        try:
+            async with get_session() as session:
+                res = await session.run(
+                    "MATCH (p:Person) WHERE p.id IN $ids "
+                    "RETURN p.id AS id, p.name AS name, p.known_as AS known_as, p.avatar AS avatar",
+                    ids=list(person_ids_to_lookup),
+                )
+                for row in await res.data():
+                    people[row["id"]] = row
+        except Exception as e:
+            log.warning(f"person lookup failed for cluster list: {e}")
+        for r in result:
+            p = people.get(r["person_id"])
+            if p:
+                r["person_name"]   = p.get("name") or p.get("known_as")
+                r["person_known_as"] = p.get("known_as") if p.get("known_as") != p.get("name") else None
+                r["person_avatar"] = p.get("avatar")
 
     return {"clusters": result, "total": total, "offset": offset}
 
 
 @router.get("/clusters/{cluster_id}")
 async def get_cluster(cluster_id: str):
-    clusters    = _load(CLUSTERS_FILE, {})
-    assignments = _load(ASSIGNMENTS_FILE, {})
+    # Person-scoped detail (from the Neo4j-backed assigned view).
+    if cluster_id.startswith("person:"):
+        person_id = cluster_id[len("person:"):]
+        async with get_session() as session:
+            res = await session.run(
+                """
+                MATCH (p:Person {id: $pid})-[r:APPEARS_IN]->(m:Media)
+                WHERE r.face_index IS NOT NULL
+                  AND r.crop_path IS NOT NULL AND r.crop_path <> ''
+                RETURN m.path AS photo_path, r.face_index AS face_index, r.crop_path AS crop_path
+                ORDER BY m.timestamp DESC
+                """,
+                pid=person_id,
+            )
+            rows = await res.data()
+        faces = [
+            {
+                "photo_path": r["photo_path"],
+                "face_index": r["face_index"],
+                "crop_url":   _crop_url(r["crop_path"]) if r["crop_path"] else None,
+            }
+            for r in rows
+        ]
+        return {"id": cluster_id, "size": len(faces), "faces": faces, "person_id": person_id}
+
+    clusters = _load(CLUSTERS_FILE, {})
 
     if cluster_id not in clusters:
         raise HTTPException(404, "Cluster not found")
 
     faces = clusters[cluster_id]
+    # Hide faces already done (Neo4j edges or face-level skips).
+    done = await _get_neo4j_assigned()
+    done = set(done) | await _get_neo4j_skipped()
+    faces = [
+        f for f in faces
+        if (
+            (f.get("photo_path", "").replace("/photos/", "", 1)
+              if f.get("photo_path", "").startswith("/photos/") else f.get("photo_path", "")),
+            int(f.get("face_index", -1))
+        ) not in done
+    ]
+
     return {
         "id":        cluster_id,
         "size":      len(faces),
@@ -641,43 +807,50 @@ async def get_cluster(cluster_id: str):
             }
             for f in faces
         ],
-        "person_id": assignments.get(cluster_id),
+        "person_id": None,
     }
 
 
 class AssignBody(BaseModel):
     person_id: str
-    # Optional faces to exclude from this assignment, as [[photo_path, face_index], ...].
-    # Excluded faces are dropped from the Neo4j sync AND appended to SKIPPED_FACES_FILE
-    # so they don't reappear in the same cluster after reclustering.
+    # Optional faces to exclude (permanent skip — written to Media.skipped_faces in Neo4j).
     exclude: list[list] | None = None
+    # Optional whitelist: only these faces are assigned. The cluster as a
+    # whole is never marked "done" — Neo4j edges per face are the only
+    # signal, so remaining faces stay in the cluster for later sessions.
+    include: list[list] | None = None
 
 
 @router.post("/clusters/{cluster_id}/assign", status_code=204)
 async def assign_cluster(cluster_id: str, body: AssignBody):
-    clusters    = _load(CLUSTERS_FILE, {})
-    assignments = _load(ASSIGNMENTS_FILE, {})
-
+    clusters = _load(CLUSTERS_FILE, {})
     if cluster_id not in clusters:
         raise HTTPException(404, "Cluster not found")
 
-    assignments[cluster_id] = body.person_id
-    _save(ASSIGNMENTS_FILE, assignments)
-
     faces = clusters[cluster_id]
 
-    # Filter excluded faces (UI lets the user deselect mismatches before assigning).
+    # Exclude (permanent face-level skip)
     if body.exclude:
         exclude_set = {(row[0], row[1]) for row in body.exclude if len(row) >= 2}
         faces = [
             f for f in faces
             if (f.get("photo_path"), f.get("face_index")) not in exclude_set
         ]
-        # Persist face-level skip so the excluded ones don't return in future reclustering.
-        existing    = {(row[0], row[1]) for row in _load(SKIPPED_FACES_FILE, [])}
-        new_entries = [list(k) for k in exclude_set if k not in existing and k[0]]
-        if new_entries:
-            _save(SKIPPED_FACES_FILE, _load(SKIPPED_FACES_FILE, []) + new_entries)
+        await _add_skipped_faces([(p, fi) for p, fi in exclude_set if p])
+
+    # Optional whitelist: only these faces get assigned.
+    if body.include is not None:
+        include_set = {(row[0], row[1]) for row in body.include if len(row) >= 2}
+        faces = [
+            f for f in faces
+            if (f.get("photo_path"), f.get("face_index")) in include_set
+        ]
+    # Neo4j sync below writes APPEARS_IN edges for `faces`; those edges
+    # are what _get_neo4j_assigned uses to hide already-done faces.
+
+    # Bust the Neo4j-assigned cache so the next list call sees the new edges.
+    global _neo4j_assigned
+    _neo4j_assigned = None
 
     # Write Neo4j APPEARS_IN in background
     threading.Thread(
@@ -698,16 +871,12 @@ async def skip_cluster(cluster_id: str):
         _save(SKIPPED_FILE, skipped)
 
     # Persist face-level skip so it survives reclustering
-    existing = {(row[0], row[1]) for row in _load(SKIPPED_FACES_FILE, [])}
-    new_entries = []
-    for f in clusters[cluster_id]:
-        key = (f.get("photo_path"), f.get("face_index"))
-        if key[0] and key[1] is not None and key not in existing:
-            new_entries.append(list(key))
-            existing.add(key)
-    if new_entries:
-        all_entries = _load(SKIPPED_FACES_FILE, []) + new_entries
-        _save(SKIPPED_FACES_FILE, all_entries)
+    items = [
+        (f.get("photo_path"), f.get("face_index"))
+        for f in clusters[cluster_id]
+        if f.get("photo_path") and f.get("face_index") is not None
+    ]
+    await _add_skipped_faces(items)
 
 
 @router.post("/clusters/{cluster_id}/unskip", status_code=204)
@@ -719,9 +888,12 @@ async def unskip_cluster(cluster_id: str):
 
     # Remove these faces from the stable skip list
     if cluster_id in clusters:
-        remove = {(f.get("photo_path"), f.get("face_index")) for f in clusters[cluster_id]}
-        remaining = [row for row in _load(SKIPPED_FACES_FILE, []) if tuple(row) not in remove]
-        _save(SKIPPED_FACES_FILE, remaining)
+        items = [
+            (f.get("photo_path"), f.get("face_index"))
+            for f in clusters[cluster_id]
+            if f.get("photo_path") and f.get("face_index") is not None
+        ]
+        await _remove_skipped_faces(items)
 
 
 def _sync_to_neo4j(person_id: str, faces: list):
