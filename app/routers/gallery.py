@@ -209,6 +209,22 @@ async def media_detail(path: str = Query(...)):
     if not any(v not in (None, "", []) for v in heritage.values()):
         heritage = None
 
+    # Face extractor uses cv2.imread which (since OpenCV 4.7) applies EXIF
+    # orientation automatically — so bboxes in the .faces.json sidecar are
+    # already in DISPLAY coordinates. The /media/medium/ endpoint also serves
+    # display orientation (via PIL ImageOps.exif_transpose). All we need to do
+    # is make sure the media.width/height we report matches that display
+    # orientation. mpp's dimension fields are unreliable for this — use PIL
+    # directly.
+    display_w, display_h = 0, 0
+    try:
+        from PIL import Image, ImageOps
+        with Image.open(full_path) as _im:
+            _im = ImageOps.exif_transpose(_im)
+            display_w, display_h = _im.size
+    except Exception:
+        pass
+
     # Read faces sidecar — face count + bbox lookup by face_index
     unidentified = []
     faces_sidecar = Path(str(full_path) + ".faces.json")
@@ -300,8 +316,12 @@ async def media_detail(path: str = Query(...)):
             "media": {
                 "type":          media.get("type"),
                 "format":        media.get("format"),
-                "width":         dims.get("width"),
-                "height":        dims.get("height"),
+                # Report display dimensions (PIL .size after exif_transpose).
+                # Bboxes are already in display coords (cv2.imread applies EXIF
+                # orientation since OpenCV 4.7), so the frontend normalizes
+                # directly against these values.
+                "width":         display_w or dims.get("width"),
+                "height":        display_h or dims.get("height"),
                 "megapixels":    dims.get("megapixels"),
                 "orientation":   dims.get("orientation"),
                 "dominantColor": media.get("dominantColor"),
