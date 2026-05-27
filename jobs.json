@@ -4,7 +4,7 @@
     "name": "Face Detection",
     "description": "Detect faces, write .faces.json sidecars",
     "color": "#8b5cf6",
-    "whenToRun": "Run after adding new photos to /photos/archive. Step 1 of the face pipeline. Fast on small paths — limit to a year/month dir for incremental work. Use --force only to redo existing sidecars.",
+    "whenToRun": "STEP 1 of the face pipeline. Run after dropping new photos into /photos/archive. Opens each photo, finds faces, writes a .faces.json sidecar next to it. Without this, the new photos have no faces detected. Fast on small paths — narrow to a year/month dir for incremental runs. Use --force only if you want to redo sidecars that already exist (rare).",
     "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python extract_faces.py {path} {force}",
     "params": [
       {
@@ -30,7 +30,7 @@
     "name": "Face Clustering",
     "description": "Run DBSCAN on .faces.json embeddings, write clusters.json",
     "color": "#6366f1",
-    "whenToRun": "Step 3 of the face pipeline. Run after Face Detection adds significant new faces. Reads all sidecars and rewrites clusters.json. Safe to re-run — assigned and skipped faces stay tracked in Neo4j and are filtered out of the unassigned view automatically.",
+    "whenToRun": "STEP 3 of the face pipeline. Run after Face Detection if you want new faces to surface on /manage/faces/unassigned. Groups all face embeddings into clusters (Stephen's faces in one bucket, Patty's in another, etc.). Without this, new faces are detected but never appear as something you can label. Safe to re-run — assigned + skipped faces are tracked in Neo4j separately and get filtered out automatically, so re-clustering won't lose work. ~1 minute.",
     "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python cluster_faces.py --eps {eps} --min-samples {min_samples}",
     "params": [
       {
@@ -54,7 +54,7 @@
     "name": "Build Face Index",
     "description": "Read all .faces.json sidecars, write embeddings.npy + faces_meta.json for similarity search",
     "color": "#a78bfa",
-    "whenToRun": "Step 2 of the face pipeline. Run after Face Detection (and before Clustering, if you want similarity search to find newly added faces). Always rebuilds the whole index — takes a few minutes on a full archive.",
+    "whenToRun": "STEP 2 of the face pipeline. Run after Face Detection if you want the new faces searchable. Collects all face embeddings from every sidecar into one big embeddings.npy file — used by /manage/faces/similar (the 'find matches for this person' workflow). Without this, similarity search won't see the newly-detected faces. Rebuilds the whole index every time (~few minutes on the full archive). Skip unless you actually need similarity search to be current.",
     "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python build_embedding_index.py",
     "params": []
   },
@@ -63,7 +63,7 @@
     "name": "Object Detection",
     "description": "Run YOLO on archive, write .objects.json sidecars",
     "color": "#f59e0b",
-    "whenToRun": "Run after adding new photos to /photos/archive. Independent of the face pipeline. Limit path scope for incremental runs.",
+    "whenToRun": "Run after dropping new photos into /photos/archive. Writes a .objects.json sidecar listing every detected object (people, animals, vehicles, etc.) with bounding boxes. Independent of the face pipeline — no need to run before/after. Narrow the path for incremental runs.",
     "shell_command": "cd /home/stephen/photo-intelligence/services/object-detection && source venv/bin/activate && python detect_objects.py {path} --recursive {force}",
     "params": [
       {
@@ -89,7 +89,7 @@
     "name": "CLIP Embeddings",
     "description": "Extract CLIP semantic embeddings, write .clip.json sidecars",
     "color": "#06b6d4",
-    "whenToRun": "Run after adding new photos. Powers natural-language image search. Independent of other pipelines.",
+    "whenToRun": "Run after dropping new photos into /photos/archive. Writes a .clip.json sidecar with a semantic embedding per image — used for natural-language search (\"dog at beach\", \"birthday cake\"). Independent of the face / object pipelines. Narrow the path for incremental runs.",
     "shell_command": "cd /home/stephen/photo-intelligence/services/content-understanding && source venv/bin/activate && python extract_clip.py {path} --recursive {force}",
     "params": [
       {
@@ -115,7 +115,7 @@
     "name": "Scene Embeddings",
     "description": "Extract DINOv2 scene embeddings, write .scenes.json sidecars",
     "color": "#10b981",
-    "whenToRun": "Run after adding new photos. Used for visual-similarity search (\"more like this\"). Independent of other pipelines.",
+    "whenToRun": "Run after dropping new photos into /photos/archive. Writes a .scenes.json sidecar with a DINOv2 scene embedding — used for visual-similarity search (\"more photos that LOOK like this one\", regardless of subject). Independent of other pipelines. Narrow the path for incremental runs.",
     "shell_command": "cd /home/stephen/photo-intelligence/services/scene-recognition && source venv/bin/activate && python extract_scenes.py {path} --recursive {force}",
     "params": [
       {
@@ -141,7 +141,7 @@
     "name": "Archive Report",
     "description": "Scan archive metadata and regenerate report.json for Admin Overview",
     "color": "#64748b",
-    "whenToRun": "Run when the Admin Overview page numbers look stale (e.g. after a big import or after running other pipeline jobs). Takes a couple minutes; safe to run any time.",
+    "whenToRun": "Run when the /admin/overview page numbers look stale — e.g. after a big import or after any of the extractor jobs above finish. Scans every file's metadata and recounts coverage stats. ~couple minutes. Safe to run any time.",
     "shell_command": "cd /home/stephen/photo-intelligence && python mm.py report -v -o /photos/__data/status/report.txt",
     "params": []
   }
