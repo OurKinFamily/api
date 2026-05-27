@@ -603,6 +603,27 @@ async def bulk_assign_faces(body: dict):
     return {"assigned": len(faces)}
 
 
+@router.delete("/assignment", status_code=204)
+async def unassign_face(person_id: str, photo_path: str, face_index: int):
+    """Remove the APPEARS_IN edge for a specific (person, photo, face_index)
+    so a misidentified face returns to the unassigned pool."""
+    pp = photo_path.replace("/photos/", "", 1) if photo_path.startswith("/photos/") else photo_path
+    async with get_session() as session:
+        res = await session.run(
+            """
+            MATCH (p:Person {id: $person_id})-[r:APPEARS_IN]->(m:Media {path: $pp})
+            WHERE r.face_index = $face_index
+            DELETE r RETURN 1 AS ok
+            """,
+            person_id=person_id, pp=pp, face_index=face_index,
+        )
+        if not await res.single():
+            raise HTTPException(404, "Assignment not found")
+
+    global _neo4j_assigned
+    _neo4j_assigned = None
+
+
 @router.get("/clusters/lookup")
 async def lookup_face_cluster(photo_path: str, face_index: int):
     """Return the cluster_id (if any) for a specific face in a photo."""

@@ -123,6 +123,20 @@ async def list_media(
     }
 
 
+@router.delete("/media", status_code=204)
+async def delete_media(path: str = Query(...)):
+    """Remove a Media node and all its edges (face assignments, album
+    memberships, favorites, etc.). The underlying file on disk is NOT
+    touched — re-importing the path via mpp will recreate the node."""
+    async with get_session() as session:
+        res = await session.run(
+            "MATCH (m:Media {path: $path}) DETACH DELETE m RETURN 1 AS ok",
+            path=path,
+        )
+        if not await res.single():
+            raise HTTPException(404, "Media not found")
+
+
 @router.get("/years")
 async def list_years(min_confidence: str = Query(default="high")):
     """Distinct years that have media, with counts. Used by the date scrubber."""

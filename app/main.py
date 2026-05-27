@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.db.neo4j import init_driver, close_driver
 from app.middleware.auth import AuthMiddleware
-from app.routers import people, media, jobs, gallery, faces, admin, places, groups, suggestions, heritage, me
+from app.routers import people, media, jobs, gallery, faces, admin, places, groups, suggestions, heritage, me, albums
 
 
 @asynccontextmanager
@@ -27,3 +27,4 @@ app.include_router(groups.router)
 app.include_router(suggestions.router)
 app.include_router(heritage.router)
 app.include_router(me.router)
+app.include_router(albums.router)
