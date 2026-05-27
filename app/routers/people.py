@@ -1,5 +1,5 @@
 import uuid
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from app.db.neo4j import get_session
 from app.models.person import Person, PersonCreate, RelationshipAdd
@@ -113,6 +113,36 @@ async def get_person(person_id: str):
         if not record:
             raise HTTPException(status_code=404, detail="Person not found")
         return Person(**record["p"])
+
+
+@router.get("/{person_id}/connection-timeline")
+async def connection_timeline(person_id: str, min_photos: int = Query(default=30, ge=1)):
+    """For each other person who appears in ≥ min_photos with the subject,
+    return the date range of their co-appearances and the photo count.
+    Used by the PersonPage Timeline tab to render a gantt-style view of
+    overlapping social eras."""
+    async with get_session() as session:
+        res = await session.run(
+            """
+            MATCH (subject:Person {id: $id})-[:APPEARS_IN]->(m:Media)<-[:APPEARS_IN]-(other:Person)
+            WHERE other.id <> $id AND m.timestamp IS NOT NULL
+            WITH other,
+                 min(m.timestamp) AS first_ts,
+                 max(m.timestamp) AS last_ts,
+                 count(DISTINCT m) AS photo_count
+            WHERE photo_count >= $min_photos
+            RETURN other.id        AS id,
+                   other.name      AS name,
+                   other.known_as  AS known_as,
+                   other.avatar    AS avatar,
+                   toString(first_ts) AS first_ts,
+                   toString(last_ts)  AS last_ts,
+                   photo_count
+            ORDER BY first_ts ASC
+            """,
+            id=person_id, min_photos=min_photos,
+        )
+        return await res.data()
 
 
 @router.post("/{person_id}/relationships", status_code=204)
