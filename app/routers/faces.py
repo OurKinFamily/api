@@ -572,16 +572,30 @@ async def search_similar_faces_temporal(body: SearchByPersonTemporalBody):
 
 @router.post("/search/assign")
 async def bulk_assign_faces(body: dict):
-    """Assign multiple individual faces to a person."""
+    """Assign multiple individual faces to a person.
+
+    Frontend often doesn't know the crop path — derive it server-side from
+    `photo_path + face_index` so every edge gets a usable crop_path. This
+    matches the canonical layout face extraction writes:
+    `__faces/crops/<year>/<month>/<filename>_face<N>.jpg`."""
     person_id = body.get("person_id")
-    faces     = body.get("faces", [])  # list of {photo_path, face_index, crop_path}
+    faces     = body.get("faces", [])  # list of {photo_path, face_index, crop_path?}
     if not person_id or not faces:
         raise HTTPException(400, "person_id and faces required")
+
+    def _canonical_crop_path(photo_path: str, face_index) -> str:
+        if not photo_path or face_index is None: return ""
+        if photo_path.startswith("archive/"):
+            stripped = photo_path[len("archive/"):]
+            candidate = f"__faces/crops/{stripped}_face{face_index}.jpg"
+            full = settings.photos_root / candidate
+            return candidate if full.exists() else ""
+        return ""
 
     async with get_session() as session:
         for f in faces:
             photo_path = f.get("photo_path", "").replace("/photos/", "", 1)
-            crop_path  = f.get("crop_path",  "").replace("/photos/", "", 1)
+            crop_path  = f.get("crop_path",  "").replace("/photos/", "", 1) or _canonical_crop_path(photo_path, f.get("face_index"))
             await session.run(
                 """
                 MATCH (person:Person {id: $person_id})
