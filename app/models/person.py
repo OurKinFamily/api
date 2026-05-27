@@ -31,3 +31,6 @@ class Person(BaseModel):
     is_living: bool = True
     notes: Optional[str] = None
     avatar: Optional[str] = None
+    cover_image: Optional[str] = None
+    cover_position: Optional[str] = None  # 'top' | 'center' | 'bottom'
+    email: Optional[str] = None

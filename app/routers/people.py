@@ -8,6 +8,11 @@ from app.models.person import Person, PersonCreate, RelationshipAdd
 class AvatarSet(BaseModel):
     crop_path: str
 
+
+class CoverSet(BaseModel):
+    photo_path: str | None = None  # null = clear cover, fall back to random
+    position:   str | None = None  # 'top' | 'center' | 'bottom' (default center)
+
 router = APIRouter(prefix="/people", tags=["people"])
 
 
@@ -201,6 +206,20 @@ async def set_avatar(person_id: str, body: AvatarSet):
         result = await session.run(
             "MATCH (p:Person {id: $id}) SET p.avatar = $avatar RETURN p",
             id=person_id, avatar=body.crop_path
+        )
+        record = await result.single()
+        if not record:
+            raise HTTPException(status_code=404, detail="Person not found")
+
+
+@router.put("/{person_id}/cover", status_code=204)
+async def set_cover(person_id: str, body: CoverSet):
+    """Set (or clear, with null) the cover_image used by PersonPage's hero
+    banner. `position` controls vertical crop alignment: top / center / bottom."""
+    async with get_session() as session:
+        result = await session.run(
+            "MATCH (p:Person {id: $id}) SET p.cover_image = $cover, p.cover_position = $pos RETURN p",
+            id=person_id, cover=body.photo_path, pos=body.position,
         )
         record = await result.single()
         if not record:
