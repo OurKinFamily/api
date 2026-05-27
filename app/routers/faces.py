@@ -586,9 +586,8 @@ async def bulk_assign_faces(body: dict):
                 """
                 MATCH (person:Person {id: $person_id})
                 MATCH (photo:Media {path: $photo_path})
-                MERGE (person)-[r:APPEARS_IN]->(photo)
-                SET r.face_index = $face_index,
-                    r.crop_path  = $crop_path,
+                MERGE (person)-[r:APPEARS_IN {face_index: $face_index}]->(photo)
+                SET r.crop_path  = $crop_path,
                     r.photo_path = $photo_path
                 """,
                 person_id=person_id,
@@ -919,9 +918,8 @@ def _sync_to_neo4j(person_id: str, faces: list):
                     UNWIND $batch AS row
                     MATCH (person:Person {id: $person_id})
                     MATCH (photo:Media {path: row.photo_path})
-                    MERGE (person)-[r:APPEARS_IN]->(photo)
-                    SET r.face_index = row.face_index,
-                        r.crop_path  = row.crop_path,
+                    MERGE (person)-[r:APPEARS_IN {face_index: row.face_index}]->(photo)
+                    SET r.crop_path  = row.crop_path,
                         r.photo_path = row.photo_path
                     """,
                     person_id=person_id,
