@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
-from app.db import get_session
+from app.db.neo4j import get_session
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
