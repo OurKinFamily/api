@@ -466,6 +466,130 @@ async def get_faces(person_id: str):
         ]
 
 
+def _format_age(age_years: float) -> str:
+    if age_years < 0:
+        return ""
+    if age_years < 1:
+        days = age_years * 365.25
+        if days < 7:
+            return "newborn"
+        if days < 60:
+            return f"{int(days)} days"
+        months = max(1, int(age_years * 12))
+        return f"{months} months"
+    return f"age {int(age_years)}"
+
+
+# Bucket definitions: (low_inclusive, high_inclusive, label)
+_LIFE_BUCKETS = [
+    (0,  1,  "baby"),
+    (2,  4,  "toddler"),
+    (5,  9,  "kid"),
+    (10, 14, "preteen"),
+    (15, 19, "teen"),
+    (20, 29, "twenties"),
+    (30, 39, "thirties"),
+    (40, 49, "forties"),
+    (50, 59, "fifties"),
+    (60, 69, "sixties"),
+    (70, 999, "seventies+"),
+]
+
+
+@router.get("/{person_id}/life-stages")
+async def life_stages(person_id: str):
+    """For each age bucket (baby → seventies+), pick one representative
+    photo of this person. Selection: favorited > chronologically first.
+    Used by the Person Overview to render the life-stages strip."""
+    from datetime import datetime
+    async with get_session() as session:
+        res = await session.run(
+            """
+            MATCH (p:Person {id: $id})
+            OPTIONAL MATCH (p)-[mine:APPEARS_IN]->(m:Media)
+              WHERE m.timestamp IS NOT NULL AND toString(m.timestamp) > '1800-01-01'
+            OPTIONAL MATCH (other:Person)-[:APPEARS_IN]->(m)
+            OPTIONAL MATCH (:Person)-[fav:FAVORITED]->(m)
+            WITH p, m, mine,
+                 count(DISTINCT other) AS appears_count,
+                 count(fav) > 0        AS favorited
+            RETURN p.birth_date AS birth,
+                   p.birth_date_precision AS prec,
+                   collect(DISTINCT {
+                     path: m.path,
+                     ts: toString(m.timestamp),
+                     is_video: m.is_video,
+                     poster_path: m.poster_path,
+                     crop_path: mine.crop_path,
+                     favorited: favorited,
+                     solo: appears_count = 1
+                   }) AS photos
+            """,
+            id=person_id,
+        )
+        rec = await res.single()
+    if not rec or not rec["birth"]:
+        return {"buckets": []}
+
+    # Birth date — accept YYYY / YYYY-MM / YYYY-MM-DD
+    raw = str(rec["birth"]).split("T")[0]
+    parts = raw.split("-")
+    try:
+        y = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 1
+        d = int(parts[2]) if len(parts) > 2 else 1
+        birth_dt = datetime(y, m, d)
+    except (ValueError, IndexError):
+        return {"buckets": []}
+
+    photos_in = [p for p in rec["photos"] if p.get("path") and p.get("ts")]
+    photos = []
+    for p in photos_in:
+        try:
+            ts = datetime.fromisoformat(p["ts"].split(".")[0].replace("Z", "").rstrip("+"))
+        except ValueError:
+            continue
+        years = (ts - birth_dt).days / 365.25
+        if years < 0:
+            continue
+        photos.append({**p, "ts_parsed": ts, "age_years": years})
+
+    # Stills only — a video's poster frame can't be trusted to actually
+    # show the person we're profiling, so drop videos from the candidate
+    # pool entirely. Bucket disappears if no stills exist for that age.
+    stills_all = [p for p in photos if not p.get("is_video")]
+    buckets_out = []
+    for lo, hi, label in _LIFE_BUCKETS:
+        in_bucket = [p for p in stills_all if lo <= p["age_years"] <= hi]
+        if not in_bucket:
+            continue
+        # Preference cascade: favorited+solo > solo > favorited > anything.
+        # "Solo" = target is the only tagged person → most likely a portrait.
+        solo = [p for p in in_bucket if p.get("solo")]
+        favs = [p for p in in_bucket if p["favorited"]]
+        fav_solo = [p for p in solo if p["favorited"]]
+        pool = fav_solo or solo or favs or in_bucket
+        chosen = min(pool, key=lambda x: x["ts_parsed"])
+        # Thumb URL: videos use poster jpg; images use thumb webp route.
+        thumb_url = (
+            f"/api/media/{chosen['poster_path']}"
+            if chosen.get("is_video") and chosen.get("poster_path")
+            else f"/api/media/thumb/{chosen['path']}"
+        )
+        crop_path = chosen.get("crop_path")
+        buckets_out.append({
+            "bucket": label,
+            "age_text": _format_age(chosen["age_years"]),
+            "path": chosen["path"],
+            "url": f"/api/media/{chosen['path']}",
+            "thumb_url": thumb_url,
+            "crop_url": f"/api/media/{crop_path}" if crop_path else None,
+            "is_video": bool(chosen.get("is_video")),
+            "count": len(in_bucket),
+        })
+    return {"buckets": buckets_out}
+
+
 @router.get("/{person_id}/photos")
 async def get_photos(person_id: str, limit: int = 100, offset: int = 0):
     async with get_session() as session:
