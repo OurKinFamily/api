@@ -608,24 +608,46 @@ async def bulk_assign_faces(body: dict, request: Request):
         request_id=request_id,
     ).info("face bulk assign started")
 
+    assigned_count = 0
+    missing: list[dict] = []
     async with get_session() as session:
         for f in faces:
             photo_path = f.get("photo_path", "").replace("/photos/", "", 1)
             crop_path  = f.get("crop_path",  "").replace("/photos/", "", 1) or _canonical_crop_path(photo_path, f.get("face_index"))
             face_index = f.get("face_index")
-            await session.run(
+            res = await session.run(
                 """
                 MATCH (person:Person {id: $person_id})
                 MATCH (photo:Media {path: $photo_path})
                 MERGE (person)-[r:APPEARS_IN {face_index: $face_index}]->(photo)
                 SET r.crop_path  = $crop_path,
                     r.photo_path = $photo_path
+                RETURN photo.path AS p
                 """,
                 person_id=person_id,
                 photo_path=photo_path,
                 face_index=face_index,
                 crop_path=crop_path,
             )
+            row = await res.single()
+            if row is None:
+                # Either person doesn't exist or media path doesn't match
+                # anything in Neo4j (common when embedding index has stale
+                # paths). Log it loudly so the UI sees the count drop +
+                # we get a Loki signal.
+                missing.append({"photo_path": photo_path, "face_index": face_index})
+                log.bind(
+                    event="face.assign.skipped",
+                    person_id=person_id,
+                    photo_path=photo_path,
+                    face_index=face_index,
+                    reason="media_or_person_not_found",
+                    bulk_id=bulk_id,
+                    by=by,
+                    request_id=request_id,
+                ).warning("face assign skipped")
+                continue
+            assigned_count += 1
             log.bind(
                 event="face.assigned",
                 person_id=person_id,
@@ -642,7 +664,7 @@ async def bulk_assign_faces(body: dict, request: Request):
     global _neo4j_assigned
     _neo4j_assigned = None
 
-    return {"assigned": len(faces)}
+    return {"assigned": assigned_count, "missing": missing, "requested": len(faces)}
 
 
 @router.delete("/assignment", status_code=204)
