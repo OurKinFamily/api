@@ -680,98 +680,226 @@ async def relationship_to_viewer(person_id: str, request: Request):
         return {"label": None, "side": None}
 
 
-@router.get("/{person_id}/life-stages")
-async def life_stages(person_id: str):
-    """For each age bucket (baby → seventies+), pick one representative
-    photo of this person. Selection: favorited > chronologically first.
-    Used by the Person Overview to render the life-stages strip."""
+def _parse_birth(birth_raw):
     from datetime import datetime
-    async with get_session() as session:
-        res = await session.run(
-            """
-            MATCH (p:Person {id: $id})
-            OPTIONAL MATCH (p)-[mine:APPEARS_IN]->(m:Media)
-              WHERE m.timestamp IS NOT NULL AND toString(m.timestamp) > '1800-01-01'
-            OPTIONAL MATCH (other:Person)-[:APPEARS_IN]->(m)
-            OPTIONAL MATCH (:Person)-[fav:FAVORITED]->(m)
-            WITH p, m, mine,
-                 count(DISTINCT other) AS appears_count,
-                 count(fav) > 0        AS favorited
-            RETURN p.birth_date AS birth,
-                   p.birth_date_precision AS prec,
-                   collect(DISTINCT {
-                     path: m.path,
-                     ts: toString(m.timestamp),
-                     is_video: m.is_video,
-                     poster_path: m.poster_path,
-                     crop_path: mine.crop_path,
-                     favorited: favorited,
-                     solo: appears_count = 1
-                   }) AS photos
-            """,
-            id=person_id,
-        )
-        rec = await res.single()
-    if not rec or not rec["birth"]:
-        return {"buckets": []}
-
-    # Birth date — accept YYYY / YYYY-MM / YYYY-MM-DD
-    raw = str(rec["birth"]).split("T")[0]
+    raw = str(birth_raw).split("T")[0]
     parts = raw.split("-")
     try:
         y = int(parts[0])
-        m = int(parts[1]) if len(parts) > 1 else 1
+        mo = int(parts[1]) if len(parts) > 1 else 1
         d = int(parts[2]) if len(parts) > 2 else 1
-        birth_dt = datetime(y, m, d)
+        return datetime(y, mo, d)
     except (ValueError, IndexError):
-        return {"buckets": []}
+        return None
 
-    photos_in = [p for p in rec["photos"] if p.get("path") and p.get("ts")]
+
+def _life_stage_score(p):
+    """Higher = better. Solo+favorited tops the list."""
+    return (
+        (4 if p["favorited"] and p.get("solo") else 0)
+        + (2 if p.get("solo") else 0)
+        + (1 if p["favorited"] else 0)
+    )
+
+
+def _life_stage_tile(label, chosen, age_years, count, locked):
+    thumb_url = (
+        f"/api/media/{chosen['poster_path']}"
+        if chosen.get("is_video") and chosen.get("poster_path")
+        else f"/api/media/thumb/{chosen['path']}"
+    )
+    crop_path = chosen.get("crop_path")
+    return {
+        "bucket": label,
+        "age_text": _format_age(age_years),
+        "path": chosen["path"],
+        "url": f"/api/media/{chosen['path']}",
+        "thumb_url": thumb_url,
+        "crop_url": f"/api/media/{crop_path}" if crop_path else None,
+        "is_video": bool(chosen.get("is_video")),
+        "count": count,
+        "locked": locked,
+    }
+
+
+async def _fetch_life_stage_pool(session, person_id):
+    """Returns (birth_dt, stills_with_age, locked_by_bucket) — shared by
+    the list endpoint, the candidates endpoint, and any future tooling.
+
+    If the person has a `death_date`, photos taken meaningfully after
+    death are dropped: those are posthumous shots (e.g. a framed portrait
+    in the background of a later photo), not "this is what they looked
+    like at age 92"."""
+    from datetime import datetime
+    res = await session.run(
+        """
+        MATCH (p:Person {id: $id})
+        OPTIONAL MATCH (p)-[mine:APPEARS_IN]->(m:Media)
+          WHERE m.timestamp IS NOT NULL AND toString(m.timestamp) > '1800-01-01'
+        OPTIONAL MATCH (other:Person)-[:APPEARS_IN]->(m)
+        OPTIONAL MATCH (:Person)-[fav:FAVORITED]->(m)
+        WITH p, m, mine,
+             count(DISTINCT other) AS appears_count,
+             count(fav) > 0        AS favorited
+        WITH p, collect(DISTINCT {
+              path: m.path, ts: toString(m.timestamp),
+              is_video: m.is_video, poster_path: m.poster_path,
+              crop_path: mine.crop_path,
+              favorited: favorited, solo: appears_count = 1
+            }) AS photos
+        OPTIONAL MATCH (p)-[ls:LIFE_STAGE]->(locked:Media)
+        RETURN p.birth_date AS birth, p.death_date AS death, photos,
+               collect(DISTINCT {bucket: ls.bucket, path: locked.path}) AS locks
+        """,
+        id=person_id,
+    )
+    rec = await res.single()
+    if not rec or not rec["birth"]:
+        return None, [], {}
+
+    birth_dt = _parse_birth(rec["birth"])
+    if not birth_dt:
+        return None, [], {}
+
+    # Death cutoff. Allow a small grace window (1 year) — funeral / memorial
+    # photos within ~12 months are still likely the same era. After that,
+    # exclude.
+    death_dt = _parse_birth(rec["death"]) if rec.get("death") else None
+    max_age = (
+        ((death_dt - birth_dt).days / 365.25) + 1.0
+        if death_dt else None
+    )
+
+    raw_photos = [p for p in rec["photos"] if p.get("path") and p.get("ts")]
     photos = []
-    for p in photos_in:
+    for p in raw_photos:
         try:
-            ts = datetime.fromisoformat(p["ts"].split(".")[0].replace("Z", "").rstrip("+"))
+            ts = datetime.fromisoformat(
+                p["ts"].split(".")[0].replace("Z", "").rstrip("+")
+            )
         except ValueError:
             continue
         years = (ts - birth_dt).days / 365.25
         if years < 0:
             continue
+        if max_age is not None and years > max_age:
+            continue
         photos.append({**p, "ts_parsed": ts, "age_years": years})
+    stills = [p for p in photos if not p.get("is_video")]
+    locked = {row["bucket"]: row["path"] for row in rec["locks"] if row.get("bucket")}
+    return birth_dt, stills, locked
 
-    # Stills only — a video's poster frame can't be trusted to actually
-    # show the person we're profiling, so drop videos from the candidate
-    # pool entirely. Bucket disappears if no stills exist for that age.
-    stills_all = [p for p in photos if not p.get("is_video")]
-    buckets_out = []
+
+def _sort_bucket(in_bucket):
+    """In-place sort: highest score first; oldest first within score."""
+    in_bucket.sort(key=lambda x: (-_life_stage_score(x), x["ts_parsed"]))
+    return in_bucket
+
+
+@router.get("/{person_id}/life-stages")
+async def life_stages(person_id: str):
+    """For each age bucket (baby → seventies+), pick one representative
+    photo of this person. Honors any locked override (LIFE_STAGE edge);
+    otherwise auto-picks via favorited+solo > solo > favorited > newest."""
+    async with get_session() as session:
+        birth_dt, stills, locked_by_bucket = await _fetch_life_stage_pool(session, person_id)
+    if birth_dt is None:
+        return {"buckets": []}
+
+    out = []
     for lo, hi, label in _LIFE_BUCKETS:
-        in_bucket = [p for p in stills_all if lo <= p["age_years"] <= hi]
+        in_bucket = [p for p in stills if lo <= p["age_years"] <= hi]
         if not in_bucket:
             continue
-        # Preference cascade: favorited+solo > solo > favorited > anything.
-        # "Solo" = target is the only tagged person → most likely a portrait.
-        solo = [p for p in in_bucket if p.get("solo")]
-        favs = [p for p in in_bucket if p["favorited"]]
-        fav_solo = [p for p in solo if p["favorited"]]
-        pool = fav_solo or solo or favs or in_bucket
-        chosen = min(pool, key=lambda x: x["ts_parsed"])
-        # Thumb URL: videos use poster jpg; images use thumb webp route.
-        thumb_url = (
-            f"/api/media/{chosen['poster_path']}"
-            if chosen.get("is_video") and chosen.get("poster_path")
-            else f"/api/media/thumb/{chosen['path']}"
+        _sort_bucket(in_bucket)
+        locked_path = locked_by_bucket.get(label)
+        chosen = None
+        if locked_path:
+            chosen = next((p for p in in_bucket if p["path"] == locked_path), None)
+        if chosen is None:
+            chosen = in_bucket[0]
+            locked_path = None  # locked photo missing from pool → treat as unlocked
+        out.append(_life_stage_tile(label, chosen, chosen["age_years"], len(in_bucket), bool(locked_path)))
+    return {"buckets": out}
+
+
+@router.get("/{person_id}/life-stages/{bucket}/candidates")
+async def life_stage_candidates(person_id: str, bucket: str, limit: int = 24):
+    """All candidate photos for one age bucket, sorted best-first.
+    Drives the 'swap to a different one' UI."""
+    async with get_session() as session:
+        birth_dt, stills, _ = await _fetch_life_stage_pool(session, person_id)
+    if birth_dt is None:
+        return {"candidates": []}
+    bracket = next((b for b in _LIFE_BUCKETS if b[2] == bucket), None)
+    if bracket is None:
+        raise HTTPException(404, f"Unknown bucket {bucket!r}")
+    lo, hi, _ = bracket
+    in_bucket = [p for p in stills if lo <= p["age_years"] <= hi]
+    _sort_bucket(in_bucket)
+    out = [
+        _life_stage_tile(bucket, p, p["age_years"], len(in_bucket), False)
+        for p in in_bucket[:limit]
+    ]
+    return {"candidates": out}
+
+
+class LifeStageLockBody(BaseModel):
+    bucket: str
+    path: str
+
+
+@router.put("/{person_id}/life-stages")
+async def lock_life_stage(person_id: str, body: LifeStageLockBody, request: Request):
+    """Pin one photo as the persisted representative for a bucket.
+    Idempotent: replaces any existing lock for that bucket."""
+    async with get_session() as session:
+        # Verify the media exists + the person actually appears in it.
+        check = await session.run(
+            """
+            MATCH (p:Person {id: $pid})-[:APPEARS_IN]->(m:Media {path: $path})
+            RETURN count(*) AS n
+            """,
+            pid=person_id, path=body.path,
         )
-        crop_path = chosen.get("crop_path")
-        buckets_out.append({
-            "bucket": label,
-            "age_text": _format_age(chosen["age_years"]),
-            "path": chosen["path"],
-            "url": f"/api/media/{chosen['path']}",
-            "thumb_url": thumb_url,
-            "crop_url": f"/api/media/{crop_path}" if crop_path else None,
-            "is_video": bool(chosen.get("is_video")),
-            "count": len(in_bucket),
-        })
-    return {"buckets": buckets_out}
+        row = await check.single()
+        if not row or row["n"] == 0:
+            raise HTTPException(404, "Person doesn't appear in that media")
+        await session.run(
+            """
+            MATCH (p:Person {id: $pid})
+            OPTIONAL MATCH (p)-[old:LIFE_STAGE {bucket: $bucket}]->()
+            DELETE old
+            WITH p
+            MATCH (m:Media {path: $path})
+            MERGE (p)-[:LIFE_STAGE {bucket: $bucket}]->(m)
+            """,
+            pid=person_id, bucket=body.bucket, path=body.path,
+        )
+    logger.bind(
+        event="life_stage.locked",
+        person_id=person_id, bucket=body.bucket, path=body.path,
+        **_ctx(request),
+    ).info("life-stage locked")
+    return {"ok": True}
+
+
+@router.delete("/{person_id}/life-stages/{bucket}", status_code=204)
+async def unlock_life_stage(person_id: str, bucket: str, request: Request):
+    """Drop the lock on a bucket so it goes back to auto-pick."""
+    async with get_session() as session:
+        await session.run(
+            """
+            MATCH (p:Person {id: $pid})-[ls:LIFE_STAGE {bucket: $bucket}]->()
+            DELETE ls
+            """,
+            pid=person_id, bucket=bucket,
+        )
+    logger.bind(
+        event="life_stage.unlocked",
+        person_id=person_id, bucket=bucket,
+        **_ctx(request),
+    ).info("life-stage unlocked")
 
 
 @router.get("/{person_id}/photos")
