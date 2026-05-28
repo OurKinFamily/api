@@ -466,6 +466,67 @@ async def get_faces(person_id: str):
         ]
 
 
+def _ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        s = "th"
+    else:
+        s = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{s}"
+
+
+def _format_relationship(n: int, m: int, subject_gender: str | None) -> str:
+    """Map LCA distances to an English relationship label, viewer→subject.
+
+    n = viewer's hops up to LCA;  m = subject's hops up to LCA.
+    Gendered terms when subject_gender known; fall back to neutral phrasing.
+    """
+    male = subject_gender == "male"
+    female = subject_gender == "female"
+    M = lambda f, m, n: f if female else (m if male else n)  # noqa: E731
+
+    if n == 0 and m == 0:
+        return "yourself"
+
+    # Subject is viewer's descendant (n=0)
+    if n == 0:
+        if m == 1: return f"your {M('daughter','son','child')}"
+        if m == 2: return f"your grand{M('daughter','son','child')}"
+        if m == 3: return f"your great-grand{M('daughter','son','child')}"
+        return f"your {m-2}× great-grand{M('daughter','son','child')}"
+
+    # Subject is viewer's ancestor (m=0)
+    if m == 0:
+        if n == 1: return f"your {M('mother','father','parent')}"
+        if n == 2: return f"your grand{M('mother','father','parent')}"
+        if n == 3: return f"your great-grand{M('mother','father','parent')}"
+        return f"your {n-2}× great-grand{M('mother','father','parent')}"
+
+    # Siblings
+    if n == 1 and m == 1:
+        return f"your {M('sister','brother','sibling')}"
+
+    # Niblings (subject is descendant of viewer's sibling)
+    if n == 1:
+        prefix = "great-" * (m - 2)
+        if m == 2: return f"your {M('niece','nephew','niece or nephew')}"
+        return f"your {prefix}grand-{M('niece','nephew','niece or nephew')}"
+
+    # Aunts / uncles (subject is sibling of viewer's ancestor)
+    if m == 1:
+        prefix = "great-" * (n - 2)
+        if n == 2: return f"your {M('aunt','uncle','aunt or uncle')}"
+        return f"your {prefix}grand{M('aunt','uncle','aunt or uncle')}"
+
+    # Cousins
+    cousin_n = min(n, m) - 1
+    removed = abs(n - m)
+    base = f"your {_ordinal(cousin_n)} cousin"
+    if removed == 0: return base
+    if removed == 1: return f"{base} once removed"
+    if removed == 2: return f"{base} twice removed"
+    return f"{base} {removed} times removed"
+
+
 def _format_age(age_years: float) -> str:
     if age_years < 0:
         return ""
@@ -494,6 +555,129 @@ _LIFE_BUCKETS = [
     (60, 69, "sixties"),
     (70, 999, "seventies+"),
 ]
+
+
+@router.get("/{person_id}/relationship")
+async def relationship_to_viewer(person_id: str, request: Request):
+    """Viewer→subject English relationship line for the Person header.
+
+    Walks PARENT_OF up from both viewer and subject, finds the lowest common
+    ancestor, formats the (n, m) hop pair into English (parent / cousin /
+    great-grand-uncle / etc), and tags maternal/paternal side using the
+    viewer's parent gender. Spouse + in-law shortcuts handled before the
+    blood-line walk.
+    """
+    # Lazy import to avoid circular deps with me.py
+    from app.routers.me import _current_email
+    email = _current_email(request)
+    if not email:
+        return {"label": None, "side": None}
+
+    async with get_session() as session:
+        # Resolve viewer
+        rv = await session.run("MATCH (v:Person {email: $e}) RETURN v.id AS id", e=email)
+        vrow = await rv.single()
+        if not vrow:
+            return {"label": None, "side": None}
+        viewer_id = vrow["id"]
+        if viewer_id == person_id:
+            return {"label": "yourself", "side": None}
+
+        # Direct spouse shortcut
+        rs = await session.run(
+            """
+            MATCH (v:Person {id: $vid})-[:MARRIED_TO]-(s:Person {id: $sid})
+            RETURN count(*) > 0 AS yes
+            """,
+            vid=viewer_id, sid=person_id,
+        )
+        srow = await rs.single()
+        if srow and srow["yes"]:
+            return {"label": "your spouse", "side": None}
+
+        # Pull viewer's ancestors (incl self at dist 0). For each non-self
+        # ancestor, also capture which immediate parent of the viewer leads
+        # to that ancestor (so we can label maternal/paternal side).
+        rva = await session.run(
+            """
+            MATCH path = (v:Person {id: $vid})<-[:PARENT_OF*1..8]-(anc:Person)
+            RETURN anc.id           AS id,
+                   length(path)     AS dist,
+                   nodes(path)[1].id AS first_parent_id
+            """,
+            vid=viewer_id,
+        )
+        v_anc: dict[str, tuple[int, str | None]] = {viewer_id: (0, None)}
+        for row in await rva.data():
+            d = row["dist"]
+            cur = v_anc.get(row["id"])
+            if cur is None or d < cur[0]:
+                v_anc[row["id"]] = (d, row["first_parent_id"])
+
+        # Pull subject's ancestors
+        rsa = await session.run(
+            """
+            MATCH path = (s:Person {id: $sid})<-[:PARENT_OF*0..8]-(anc:Person)
+            RETURN anc.id AS id, min(length(path)) AS dist
+            """,
+            sid=person_id,
+        )
+        s_anc = {row["id"]: row["dist"] for row in await rsa.data()}
+
+        # Subject's own props (for gendered terms)
+        rsp = await session.run("MATCH (s:Person {id: $sid}) RETURN s.gender AS g", sid=person_id)
+        subj_row = await rsp.single()
+        subj_gender = subj_row["g"] if subj_row else None
+
+        common = set(v_anc) & set(s_anc)
+        if common:
+            best = min(common, key=lambda x: v_anc[x][0] + s_anc[x])
+            n, parent_via = v_anc[best]
+            m = s_anc[best]
+            label = _format_relationship(n, m, subj_gender)
+            side = None
+            # Siblings share both parents → showing a "side" is arbitrary.
+            # Same for descendants of the viewer (your kids aren't on a "side").
+            if parent_via and n >= 1 and not (n == 1 and m == 1):
+                rp = await session.run(
+                    "MATCH (p:Person {id: $pid}) RETURN p.gender AS g",
+                    pid=parent_via,
+                )
+                prow = await rp.single()
+                if prow and prow["g"] == "female":
+                    side = "your mother's side"
+                elif prow and prow["g"] == "male":
+                    side = "your father's side"
+            return {"label": label, "side": side}
+
+        # In-law: subject married to one of viewer's blood relatives
+        rl = await session.run(
+            """
+            MATCH (s:Person {id: $sid})-[:MARRIED_TO]-(rel:Person)
+            RETURN rel.id AS id, rel.gender AS gender
+            """,
+            sid=person_id,
+        )
+        for row in await rl.data():
+            rel_id = row["id"]
+            if rel_id in v_anc:
+                vn, parent_via = v_anc[rel_id]
+                rel_label = _format_relationship(vn, 0, row["gender"])
+                spouse_word = ("wife" if subj_gender == "female"
+                               else "husband" if subj_gender == "male"
+                               else "spouse")
+                label = f"{rel_label}'s {spouse_word}"
+                side = None
+                if parent_via:
+                    rp = await session.run(
+                        "MATCH (p:Person {id: $pid}) RETURN p.gender AS g", pid=parent_via,
+                    )
+                    prow = await rp.single()
+                    if prow and prow["g"] == "female": side = "your mother's side"
+                    elif prow and prow["g"] == "male": side = "your father's side"
+                return {"label": label, "side": side}
+
+        return {"label": None, "side": None}
 
 
 @router.get("/{person_id}/life-stages")
