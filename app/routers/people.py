@@ -1,8 +1,17 @@
 import uuid
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from app.db.neo4j import get_session
+from app.log import logger
 from app.models.person import Person, PersonCreate, RelationshipAdd
+
+
+def _ctx(request: Request) -> dict:
+    """Standard bindings every mutation logger needs."""
+    return {
+        "by": getattr(request.state, "user_email", None),
+        "request_id": getattr(request.state, "request_id", None),
+    }
 
 
 class AvatarSet(BaseModel):
@@ -41,7 +50,7 @@ async def list_people():
 
 
 @router.post("/", response_model=Person, status_code=201)
-async def create_person(data: PersonCreate):
+async def create_person(data: PersonCreate, request: Request):
     async with get_session() as session:
         person_id = str(uuid.uuid4())
         result = await session.run(
@@ -60,6 +69,12 @@ async def create_person(data: PersonCreate):
             birth_date_precision=data.birth_date_precision,
         )
         record = await result.single()
+        logger.bind(
+            event="person.created",
+            person_id=person_id,
+            name=data.name,
+            **_ctx(request),
+        ).info("person created")
         return Person(**record["p"])
 
 
@@ -73,12 +88,18 @@ class PersonUpdate(BaseModel):
     death_date: str | None = None
     death_date_precision: str | None = None
     death_place: str | None = None
+    burial_place: str | None = None
+    immigration_date: str | None = None
+    immigration_place: str | None = None
+    naturalization_date: str | None = None
+    naturalization_place: str | None = None
+    ssn: str | None = None
     is_living: bool = True
     notes: str | None = None
 
 
 @router.patch("/{person_id}", response_model=Person)
-async def update_person(person_id: str, data: PersonUpdate):
+async def update_person(person_id: str, data: PersonUpdate, request: Request):
     async with get_session() as session:
         result = await session.run(
             """
@@ -87,6 +108,10 @@ async def update_person(person_id: str, data: PersonUpdate):
                 p.birth_date = $birth_date, p.birth_date_precision = $birth_date_precision,
                 p.birth_place = $birth_place, p.death_date = $death_date,
                 p.death_date_precision = $death_date_precision, p.death_place = $death_place,
+                p.burial_place = $burial_place,
+                p.immigration_date = $immigration_date, p.immigration_place = $immigration_place,
+                p.naturalization_date = $naturalization_date, p.naturalization_place = $naturalization_place,
+                p.ssn = $ssn,
                 p.is_living = $is_living, p.notes = $notes
             RETURN p
             """,
@@ -94,12 +119,85 @@ async def update_person(person_id: str, data: PersonUpdate):
             maiden_name=data.maiden_name, birth_date=data.birth_date,
             birth_date_precision=data.birth_date_precision, birth_place=data.birth_place,
             death_date=data.death_date, death_date_precision=data.death_date_precision,
-            death_place=data.death_place, is_living=data.is_living, notes=data.notes,
+            death_place=data.death_place,
+            burial_place=data.burial_place,
+            immigration_date=data.immigration_date, immigration_place=data.immigration_place,
+            naturalization_date=data.naturalization_date, naturalization_place=data.naturalization_place,
+            ssn=data.ssn,
+            is_living=data.is_living, notes=data.notes,
         )
         record = await result.single()
         if not record:
             raise HTTPException(404, "Person not found")
+        logger.bind(
+            event="person.updated",
+            person_id=person_id,
+            name=data.name,
+            **_ctx(request),
+        ).info("person updated")
         return Person(**record["p"])
+
+
+@router.get("/year-density")
+async def people_year_density(min_photos: int = Query(default=30, ge=1)):
+    """Per-person yearly photo counts. Returns one row per person whose
+    total >= min_photos: `[{id, name, known_as, avatar, total, points: [{year, count}]}]`.
+    Powers the Family page ridgeline view."""
+    async with get_session() as session:
+        res = await session.run(
+            """
+            MATCH (p:Person)-[:APPEARS_IN]->(m:Media)
+            WHERE m.timestamp IS NOT NULL AND toString(m.timestamp) > '1800-01-01'
+            WITH p, toInteger(substring(toString(m.timestamp), 0, 4)) AS year
+            WITH p, year, count(*) AS c
+            WITH p, collect({year: year, count: c}) AS points,
+                 sum(c) AS total,
+                 min(year) AS first_year
+            WHERE total >= $min_photos
+            RETURN p.id        AS id,
+                   p.name      AS name,
+                   p.known_as  AS known_as,
+                   p.avatar    AS avatar,
+                   points,
+                   total,
+                   first_year
+            ORDER BY first_year ASC, total DESC
+            """,
+            min_photos=min_photos,
+        )
+        return await res.data()
+
+
+@router.get("/timeline")
+async def people_timeline(min_photos: int = Query(default=30, ge=1)):
+    """Per-person gantt rows across ALL photos: first / last timestamp +
+    total photo count. Same row shape as /connection-timeline so the same
+    UI component can render it. Powers the Family page.
+
+    Filters out the `1700-01-01` undated sentinel so min() doesn't latch
+    onto it — keeps real heritage photos (1900s+) intact."""
+    async with get_session() as session:
+        res = await session.run(
+            """
+            MATCH (p:Person)-[:APPEARS_IN]->(m:Media)
+            WHERE m.timestamp IS NOT NULL AND toString(m.timestamp) > '1800-01-01'
+            WITH p,
+                 min(m.timestamp) AS first_ts,
+                 max(m.timestamp) AS last_ts,
+                 count(DISTINCT m) AS photo_count
+            WHERE photo_count >= $min_photos
+            RETURN p.id        AS id,
+                   p.name      AS name,
+                   p.known_as  AS known_as,
+                   p.avatar    AS avatar,
+                   toString(first_ts) AS first_ts,
+                   toString(last_ts)  AS last_ts,
+                   photo_count
+            ORDER BY first_ts ASC
+            """,
+            min_photos=min_photos,
+        )
+        return await res.data()
 
 
 @router.get("/{person_id}", response_model=Person)
@@ -125,7 +223,7 @@ async def connection_timeline(person_id: str, min_photos: int = Query(default=30
         res = await session.run(
             """
             MATCH (subject:Person {id: $id})-[:APPEARS_IN]->(m:Media)<-[:APPEARS_IN]-(other:Person)
-            WHERE other.id <> $id AND m.timestamp IS NOT NULL
+            WHERE other.id <> $id AND m.timestamp IS NOT NULL AND toString(m.timestamp) > '1800-01-01'
             WITH other,
                  min(m.timestamp) AS first_ts,
                  max(m.timestamp) AS last_ts,
@@ -146,7 +244,7 @@ async def connection_timeline(person_id: str, min_photos: int = Query(default=30
 
 
 @router.post("/{person_id}/relationships", status_code=204)
-async def add_relationship(person_id: str, body: RelationshipAdd):
+async def add_relationship(person_id: str, body: RelationshipAdd, request: Request):
     async with get_session() as session:
         # Verify both people exist
         check = await session.run(
@@ -193,6 +291,14 @@ async def add_relationship(person_id: str, body: RelationshipAdd):
         else:
             raise HTTPException(status_code=400, detail=f"Unknown relationship type: {body.rel_type}")
 
+        logger.bind(
+            event="relationship.created",
+            person_id=person_id,
+            target_id=body.target_id,
+            rel_type=body.rel_type,
+            **_ctx(request),
+        ).info("relationship created")
+
 
 class RelationshipRemove(BaseModel):
     target_id: str
@@ -200,7 +306,7 @@ class RelationshipRemove(BaseModel):
 
 
 @router.delete("/{person_id}/relationships", status_code=204)
-async def remove_relationship(person_id: str, body: RelationshipRemove):
+async def remove_relationship(person_id: str, body: RelationshipRemove, request: Request):
     async with get_session() as session:
         if body.rel_type == "spouse":
             await session.run(
@@ -229,9 +335,17 @@ async def remove_relationship(person_id: str, body: RelationshipRemove):
         else:
             raise HTTPException(400, f"Unknown rel_type: {body.rel_type}")
 
+        logger.bind(
+            event="relationship.deleted",
+            person_id=person_id,
+            target_id=body.target_id,
+            rel_type=body.rel_type,
+            **_ctx(request),
+        ).info("relationship deleted")
+
 
 @router.put("/{person_id}/avatar", status_code=204)
-async def set_avatar(person_id: str, body: AvatarSet):
+async def set_avatar(person_id: str, body: AvatarSet, request: Request):
     async with get_session() as session:
         result = await session.run(
             "MATCH (p:Person {id: $id}) SET p.avatar = $avatar RETURN p",
@@ -240,10 +354,16 @@ async def set_avatar(person_id: str, body: AvatarSet):
         record = await result.single()
         if not record:
             raise HTTPException(status_code=404, detail="Person not found")
+        logger.bind(
+            event="person.avatar_updated",
+            person_id=person_id,
+            crop_path=body.crop_path,
+            **_ctx(request),
+        ).info("avatar updated")
 
 
 @router.put("/{person_id}/cover", status_code=204)
-async def set_cover(person_id: str, body: CoverSet):
+async def set_cover(person_id: str, body: CoverSet, request: Request):
     """Set (or clear, with null) the cover_image used by PersonPage's hero
     banner. `position` controls vertical crop alignment: top / center / bottom."""
     async with get_session() as session:
@@ -254,6 +374,13 @@ async def set_cover(person_id: str, body: CoverSet):
         record = await result.single()
         if not record:
             raise HTTPException(status_code=404, detail="Person not found")
+        logger.bind(
+            event="person.cover_updated",
+            person_id=person_id,
+            cover_image=body.photo_path,
+            position=body.position,
+            **_ctx(request),
+        ).info("cover updated")
 
 
 class FaceAssign(BaseModel):
@@ -265,7 +392,7 @@ class PhotoTag(BaseModel):
     photo_path: str
 
 @router.post("/{person_id}/photos", status_code=204)
-async def tag_photo(person_id: str, body: PhotoTag):
+async def tag_photo(person_id: str, body: PhotoTag, request: Request):
     """Tag a person in a photo with no face bbox (manual addition when face
     extraction missed them). Creates APPEARS_IN without face_index/crop_path."""
     async with get_session() as session:
@@ -277,9 +404,17 @@ async def tag_photo(person_id: str, body: PhotoTag):
             """,
             person_id=person_id, photo_path=body.photo_path,
         )
+        logger.bind(
+            event="person.photo_tagged",
+            person_id=person_id,
+            photo_path=body.photo_path,
+            source="manual",
+            **_ctx(request),
+        ).info("person tagged in photo")
+
 
 @router.post("/{person_id}/faces", status_code=204)
-async def assign_face(person_id: str, body: FaceAssign):
+async def assign_face(person_id: str, body: FaceAssign, request: Request):
     async with get_session() as session:
         await session.run(
             """
@@ -295,6 +430,15 @@ async def assign_face(person_id: str, body: FaceAssign):
             face_index=body.face_index,
             crop_path=body.crop_path,
         )
+        logger.bind(
+            event="face.assigned",
+            person_id=person_id,
+            photo_path=body.photo_path,
+            face_index=body.face_index,
+            crop_path=body.crop_path,
+            source="single_assign",
+            **_ctx(request),
+        ).info("face assigned")
 
 
 @router.get("/{person_id}/faces")
@@ -397,7 +541,7 @@ async def get_connections(person_id: str):
 
 
 @router.post("/{person_id}/connections", status_code=204)
-async def add_connection(person_id: str, body: ConnectionAdd):
+async def add_connection(person_id: str, body: ConnectionAdd, request: Request):
     async with get_session() as session:
         check = await session.run(
             "MATCH (a:Person {id: $a}), (b:Person {id: $b}) RETURN count(*) AS n",
@@ -422,10 +566,18 @@ async def add_connection(person_id: str, body: ConnectionAdd):
             context=body.context, since=body.since,
             gid=body.through_group_id,
         )
+        logger.bind(
+            event="connection.created",
+            person_id=person_id,
+            target_id=body.target_id,
+            context=body.context,
+            through_group_id=body.through_group_id,
+            **_ctx(request),
+        ).info("connection created")
 
 
 @router.delete("/{person_id}/connections/{other_id}", status_code=204)
-async def remove_connection(person_id: str, other_id: str):
+async def remove_connection(person_id: str, other_id: str, request: Request):
     async with get_session() as session:
         await session.run(
             """
@@ -434,6 +586,12 @@ async def remove_connection(person_id: str, other_id: str):
             """,
             a=person_id, b=other_id,
         )
+        logger.bind(
+            event="connection.deleted",
+            person_id=person_id,
+            target_id=other_id,
+            **_ctx(request),
+        ).info("connection deleted")
 
 
 @router.get("/{person_id}/travel/points")
@@ -460,12 +618,23 @@ async def get_relatives(person_id: str):
             MATCH (p:Person {id: $id})
             OPTIONAL MATCH (p)-[:PARENT_OF]->(child:Person)
             WITH p, collect(DISTINCT {id: child.id, name: child.name, known_as: child.known_as, avatar: child.avatar}) AS children
+
+            // Parents with their parents (grandparents) nested inside.
             OPTIONAL MATCH (parent:Person)-[:PARENT_OF]->(p)
-            WITH p, children, collect(DISTINCT {id: parent.id, name: parent.name, known_as: parent.known_as, avatar: parent.avatar}) AS parents
+            OPTIONAL MATCH (gp:Person)-[:PARENT_OF]->(parent)
+            WITH p, children, parent,
+                 collect(DISTINCT {id: gp.id, name: gp.name, known_as: gp.known_as, avatar: gp.avatar}) AS gps_per_parent
+            WITH p, children,
+                 collect(DISTINCT {
+                   id: parent.id, name: parent.name, known_as: parent.known_as, avatar: parent.avatar,
+                   parents: [g IN gps_per_parent WHERE g.id IS NOT NULL]
+                 }) AS parents
+
             OPTIONAL MATCH (p)-[:MARRIED_TO]->(spouse:Person)
             WITH p, children, parents, collect(DISTINCT {id: spouse.id, name: spouse.name, known_as: spouse.known_as, avatar: spouse.avatar}) AS spouses
-            OPTIONAL MATCH (parent:Person)-[:PARENT_OF]->(p)
-            OPTIONAL MATCH (parent)-[:PARENT_OF]->(sibling:Person) WHERE sibling.id <> p.id
+
+            OPTIONAL MATCH (par2:Person)-[:PARENT_OF]->(p)
+            OPTIONAL MATCH (par2)-[:PARENT_OF]->(sibling:Person) WHERE sibling.id <> p.id
             WITH children, parents, spouses, collect(DISTINCT {id: sibling.id, name: sibling.name, known_as: sibling.known_as, avatar: sibling.avatar}) AS siblings
             RETURN children, parents, spouses, siblings
             """,

@@ -13,6 +13,14 @@ import uuid
 from fastapi import APIRouter, HTTPException, Request, Query
 from pydantic import BaseModel
 from app.db.neo4j import get_session
+from app.log import logger
+
+
+def _ctx(request: Request) -> dict:
+    return {
+        "by": getattr(request.state, "user_email", None),
+        "request_id": getattr(request.state, "request_id", None),
+    }
 
 router = APIRouter(prefix="/albums", tags=["albums"])
 
@@ -111,6 +119,13 @@ async def create_album(body: AlbumCreate, request: Request):
             uid=uid, aid=aid,
             name=body.name, description=body.description, is_private=body.is_private,
         )
+    logger.bind(
+        event="album.created",
+        album_id=aid,
+        name=body.name,
+        is_private=body.is_private,
+        **_ctx(request),
+    ).info("album created")
     return {"id": aid}
 
 
@@ -209,6 +224,12 @@ async def update_album(album_id: str, body: AlbumUpdate, request: Request):
         )
         if not await res.single():
             raise HTTPException(404, "Album not found or not owned by current user")
+    logger.bind(
+        event="album.updated",
+        album_id=album_id,
+        fields=list(params.keys() - {"aid", "uid"}),
+        **_ctx(request),
+    ).info("album updated")
 
 
 @router.delete("/{album_id}", status_code=204)
@@ -224,6 +245,11 @@ async def delete_album(album_id: str, request: Request):
         )
         if not await res.single():
             raise HTTPException(404, "Album not found or not owned by current user")
+    logger.bind(
+        event="album.deleted",
+        album_id=album_id,
+        **_ctx(request),
+    ).info("album deleted")
 
 
 @router.post("/{album_id}/media", status_code=204)
@@ -257,6 +283,22 @@ async def add_media(album_id: str, body: AlbumAddMedia, request: Request):
             """,
             aid=album_id, paths=body.paths,
         )
+    bulk_id = uuid.uuid4().hex[:12]
+    logger.bind(
+        event="album.media.bulk_added",
+        album_id=album_id,
+        count=len(body.paths),
+        bulk_id=bulk_id,
+        **_ctx(request),
+    ).info("album media bulk-added")
+    for p in body.paths:
+        logger.bind(
+            event="album.media.added",
+            album_id=album_id,
+            path=p,
+            bulk_id=bulk_id,
+            **_ctx(request),
+        ).info("album media added")
 
 
 @router.delete("/{album_id}/media", status_code=204)
@@ -283,3 +325,9 @@ async def remove_media(album_id: str, request: Request, path: str = Query(...)):
             """,
             aid=album_id, path=path,
         )
+    logger.bind(
+        event="album.media.removed",
+        album_id=album_id,
+        path=path,
+        **_ctx(request),
+    ).info("album media removed")

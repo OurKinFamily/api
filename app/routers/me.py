@@ -7,6 +7,7 @@ operate on the logged-in user's data — favorites, preferences, etc.
 import os
 from fastapi import APIRouter, HTTPException, Request, Query
 from app.db.neo4j import get_session
+from app.log import logger
 
 router = APIRouter(prefix="/me", tags=["me"])
 
@@ -110,6 +111,13 @@ async def favorite_add(request: Request, path: str = Query(...)):
             """,
             uid=user_id, path=path,
         )
+    logger.bind(
+        event="favorite.added",
+        path=path,
+        user_id=user_id,
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("favorite added")
 
 
 @router.delete("/favorites", status_code=204)
@@ -123,3 +131,10 @@ async def favorite_remove(request: Request, path: str = Query(...)):
             """,
             uid=user_id, path=path,
         )
+    logger.bind(
+        event="favorite.removed",
+        path=path,
+        user_id=user_id,
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("favorite removed")

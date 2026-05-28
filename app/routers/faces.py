@@ -4,17 +4,17 @@ and syncs assignments to Neo4j APPEARS_IN relationships.
 """
 
 import json
-import logging
 import threading
+import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.config import settings
 from app.db.neo4j import get_session
+from app.log import logger as log
 
-log = logging.getLogger(__name__)
 router = APIRouter(prefix="/faces", tags=["faces"])
 
 CLUSTERS_DIR            = settings.photos_root / "__faces" / "clusters"
@@ -571,13 +571,17 @@ async def search_similar_faces_temporal(body: SearchByPersonTemporalBody):
 
 
 @router.post("/search/assign")
-async def bulk_assign_faces(body: dict):
+async def bulk_assign_faces(body: dict, request: Request):
     """Assign multiple individual faces to a person.
 
     Frontend often doesn't know the crop path — derive it server-side from
     `photo_path + face_index` so every edge gets a usable crop_path. This
     matches the canonical layout face extraction writes:
-    `__faces/crops/<year>/<month>/<filename>_face<N>.jpg`."""
+    `__faces/crops/<year>/<month>/<filename>_face<N>.jpg`.
+
+    Emits one structured log line per face so Loki/Grafana can answer
+    "every face Stephen has assigned to this person, ever."
+    """
     person_id = body.get("person_id")
     faces     = body.get("faces", [])  # list of {photo_path, face_index, crop_path?}
     if not person_id or not faces:
@@ -592,10 +596,23 @@ async def bulk_assign_faces(body: dict):
             return candidate if full.exists() else ""
         return ""
 
+    by = getattr(request.state, "user_email", None)
+    request_id = getattr(request.state, "request_id", None)
+    bulk_id = uuid.uuid4().hex[:12]
+    log.bind(
+        event="face.bulk_assign.started",
+        person_id=person_id,
+        count=len(faces),
+        bulk_id=bulk_id,
+        by=by,
+        request_id=request_id,
+    ).info("face bulk assign started")
+
     async with get_session() as session:
         for f in faces:
             photo_path = f.get("photo_path", "").replace("/photos/", "", 1)
             crop_path  = f.get("crop_path",  "").replace("/photos/", "", 1) or _canonical_crop_path(photo_path, f.get("face_index"))
+            face_index = f.get("face_index")
             await session.run(
                 """
                 MATCH (person:Person {id: $person_id})
@@ -606,9 +623,20 @@ async def bulk_assign_faces(body: dict):
                 """,
                 person_id=person_id,
                 photo_path=photo_path,
-                face_index=f.get("face_index"),
+                face_index=face_index,
                 crop_path=crop_path,
             )
+            log.bind(
+                event="face.assigned",
+                person_id=person_id,
+                photo_path=photo_path,
+                face_index=face_index,
+                crop_path=crop_path,
+                source="search_assign",
+                bulk_id=bulk_id,
+                by=by,
+                request_id=request_id,
+            ).info("face assigned")
 
     # Invalidate Neo4j assigned-faces cache
     global _neo4j_assigned
@@ -618,7 +646,7 @@ async def bulk_assign_faces(body: dict):
 
 
 @router.delete("/assignment", status_code=204)
-async def unassign_face(person_id: str, photo_path: str, face_index: int):
+async def unassign_face(request: Request, person_id: str, photo_path: str, face_index: int):
     """Remove the APPEARS_IN edge for a specific (person, photo, face_index)
     so a misidentified face returns to the unassigned pool."""
     pp = photo_path.replace("/photos/", "", 1) if photo_path.startswith("/photos/") else photo_path
@@ -636,6 +664,15 @@ async def unassign_face(person_id: str, photo_path: str, face_index: int):
 
     global _neo4j_assigned
     _neo4j_assigned = None
+
+    log.bind(
+        event="face.unassigned",
+        person_id=person_id,
+        photo_path=pp,
+        face_index=face_index,
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("face unassigned")
 
 
 @router.get("/clusters/lookup")
@@ -856,7 +893,7 @@ class AssignBody(BaseModel):
 
 
 @router.post("/clusters/{cluster_id}/assign", status_code=204)
-async def assign_cluster(cluster_id: str, body: AssignBody):
+async def assign_cluster(cluster_id: str, body: AssignBody, request: Request):
     clusters = _load(CLUSTERS_FILE, {})
     if cluster_id not in clusters:
         raise HTTPException(404, "Cluster not found")
@@ -893,9 +930,19 @@ async def assign_cluster(cluster_id: str, body: AssignBody):
         daemon=True,
     ).start()
 
+    log.bind(
+        event="cluster.assigned",
+        cluster_id=cluster_id,
+        person_id=body.person_id,
+        count=len(faces),
+        excluded=len(body.exclude or []),
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("cluster assigned to person")
+
 
 @router.post("/clusters/{cluster_id}/skip", status_code=204)
-async def skip_cluster(cluster_id: str):
+async def skip_cluster(cluster_id: str, request: Request):
     clusters = _load(CLUSTERS_FILE, {})
     if cluster_id not in clusters:
         raise HTTPException(404, "Cluster not found")
@@ -912,9 +959,17 @@ async def skip_cluster(cluster_id: str):
     ]
     await _add_skipped_faces(items)
 
+    log.bind(
+        event="cluster.skipped",
+        cluster_id=cluster_id,
+        count=len(items),
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("cluster skipped")
+
 
 @router.post("/clusters/{cluster_id}/unskip", status_code=204)
-async def unskip_cluster(cluster_id: str):
+async def unskip_cluster(cluster_id: str, request: Request):
     clusters = _load(CLUSTERS_FILE, {})
     skipped = _load(SKIPPED_FILE, [])
     skipped = [s for s in skipped if str(s) != str(cluster_id)]
@@ -928,6 +983,13 @@ async def unskip_cluster(cluster_id: str):
             if f.get("photo_path") and f.get("face_index") is not None
         ]
         await _remove_skipped_faces(items)
+
+    log.bind(
+        event="cluster.unskipped",
+        cluster_id=cluster_id,
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("cluster unskipped")
 
 
 def _sync_to_neo4j(person_id: str, faces: list):

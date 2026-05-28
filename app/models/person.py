@@ -28,6 +28,13 @@ class Person(BaseModel):
     death_date: Optional[str] = None
     death_date_precision: Optional[str] = None
     death_place: Optional[str] = None
+    burial_place: Optional[str] = None
+    immigration_date: Optional[str] = None
+    immigration_place: Optional[str] = None
+    naturalization_date: Optional[str] = None
+    naturalization_place: Optional[str] = None
+    ssn: Optional[str] = None
+    gedcom_id: Optional[str] = None
     is_living: bool = True
     notes: Optional[str] = None
     avatar: Optional[str] = None

@@ -1,11 +1,20 @@
 import uuid
 from pathlib import Path
 from typing import Optional
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.db.neo4j import get_session
 from app.config import settings
+from app.log import logger
+
+
+def _ctx(request: Request) -> dict:
+    return {
+        "by": getattr(request.state, "user_email", None),
+        "request_id": getattr(request.state, "request_id", None),
+    }
+
 
 router = APIRouter(tags=["heritage"])
 
@@ -127,7 +136,7 @@ async def get_person_items(person_id: str):
 
 
 @router.post("/people/{person_id}/collections", status_code=201)
-async def create_collection(person_id: str, body: CollectionCreate):
+async def create_collection(person_id: str, body: CollectionCreate, request: Request):
     cid = str(uuid.uuid4())
     async with get_session() as session:
         exists = await session.run("MATCH (p:Person {id: $id}) RETURN p", id=person_id)
@@ -149,6 +158,14 @@ async def create_collection(person_id: str, body: CollectionCreate):
             base_path=body.base_path, cover_path=body.cover_path,
             description=body.description,
         )
+    logger.bind(
+        event="collection.created",
+        collection_id=cid,
+        person_id=person_id,
+        name=body.name,
+        type=body.type,
+        **_ctx(request),
+    ).info("collection created")
     return {"id": cid}
 
 
@@ -174,7 +191,7 @@ async def get_collection(collection_id: str):
 
 
 @router.patch("/collections/{collection_id}")
-async def update_collection(collection_id: str, body: CollectionUpdate):
+async def update_collection(collection_id: str, body: CollectionUpdate, request: Request):
     async with get_session() as session:
         result = await session.run(
             "MATCH (c:Collection {id: $id}) RETURN c", id=collection_id
@@ -192,6 +209,12 @@ async def update_collection(collection_id: str, body: CollectionUpdate):
             await session.run(
                 f"MATCH (c:Collection {{id: $id}}) SET {', '.join(sets)}", **params
             )
+    logger.bind(
+        event="collection.updated",
+        collection_id=collection_id,
+        fields=list(params.keys() - {"id"}),
+        **_ctx(request),
+    ).info("collection updated")
     return {"ok": True}
 
 

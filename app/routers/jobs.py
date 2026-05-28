@@ -7,7 +7,6 @@ the API container — configure that in the deploy stack when ready.
 """
 
 import json
-import logging
 import os
 import signal
 import subprocess
@@ -18,7 +17,8 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-log = logging.getLogger(__name__)
+from app.log import logger as log
+
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 JOBS_CONFIG   = Path(__file__).parent.parent.parent / "jobs.json"

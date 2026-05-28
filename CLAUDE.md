@@ -143,6 +143,18 @@ The data-rich DB is **ourkin staging** (`ourkin-graph-staging`):
 - Local `api/.env` already points `NEO4J_URI` here.
 Prod (`ourkin-graph`, volume `deploy_neo4j_data`) has no host port — query via `docker exec`.
 
+## Logging — required when adding endpoints
+
+**See `LOGGING.md` (api/) for full conventions.** Quick rule:
+
+- Every new mutation endpoint emits one `logger.bind(event="...", by=..., request_id=..., <subject_id>=...).info("...")` after the Cypher write succeeds.
+- Bulk writes: `bulk_id = uuid.uuid4().hex[:12]` on the parent + per-item lines.
+- Event names: `subject.verb` past tense (`person.created`, `face.assigned`).
+- Reads: skip unless surprising / failing.
+- After adding a new event name → add a row to the "What to log" table in `LOGGING.md` so Grafana's Edits Feed regex stays exhaustive.
+
+Dashboards already wired: `localhost:3002` → folder *Ourkin* (API Live, Edits Feed, Face Activity, Errors). New events show up automatically — no Grafana edit needed unless adding a new event family prefix.
+
 ## Coming Next
 
 - Batch remaining Old Reels (110) + 1987 videos (3) via `import_heritage_videos.py`

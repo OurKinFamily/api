@@ -1,6 +1,15 @@
 import json
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from app.db.neo4j import get_session
+from app.log import logger
+
+
+def _ctx(request: Request) -> dict:
+    return {
+        "by": getattr(request.state, "user_email", None),
+        "request_id": getattr(request.state, "request_id", None),
+    }
+
 
 router = APIRouter(prefix="/suggestions", tags=["suggestions"])
 
@@ -70,7 +79,7 @@ async def count_suggestions():
 
 
 @router.post("/{suggestion_id}/accept", status_code=204)
-async def accept_suggestion(suggestion_id: str):
+async def accept_suggestion(suggestion_id: str, request: Request):
     async with get_session() as session:
         result = await session.run(
             "MATCH (s:Suggestion {id: $id}) SET s.status = 'accepted' RETURN s.id",
@@ -78,10 +87,15 @@ async def accept_suggestion(suggestion_id: str):
         )
         if not await result.single():
             raise HTTPException(404, 'Not found')
+    logger.bind(
+        event="suggestion.accepted",
+        suggestion_id=suggestion_id,
+        **_ctx(request),
+    ).info("suggestion accepted")
 
 
 @router.post("/{suggestion_id}/reject", status_code=204)
-async def reject_suggestion(suggestion_id: str):
+async def reject_suggestion(suggestion_id: str, request: Request):
     async with get_session() as session:
         result = await session.run(
             "MATCH (s:Suggestion {id: $id}) SET s.status = 'rejected' RETURN s.id",
@@ -89,10 +103,16 @@ async def reject_suggestion(suggestion_id: str):
         )
         if not await result.single():
             raise HTTPException(404, 'Not found')
+    logger.bind(
+        event="suggestion.rejected",
+        suggestion_id=suggestion_id,
+        **_ctx(request),
+    ).info("suggestion rejected")
 
 
 @router.post("/generate", status_code=202)
-async def generate_suggestions(background_tasks: BackgroundTasks):
+async def generate_suggestions(background_tasks: BackgroundTasks, request: Request):
     from app.suggestions.generator import run_all
     background_tasks.add_task(run_all)
+    logger.bind(event="suggestions.generation_started", **_ctx(request)).info("suggestion generation started")
     return {'ok': True}

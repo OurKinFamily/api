@@ -1,20 +1,29 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.db.neo4j import init_driver, close_driver
+from app.log import logger
 from app.middleware.auth import AuthMiddleware
+from app.middleware.request_log import RequestLogMiddleware
 from app.routers import people, media, jobs, gallery, faces, admin, places, groups, suggestions, heritage, me, albums
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("api.starting")
     await init_driver()
+    logger.info("api.ready")
     yield
     await close_driver()
+    logger.info("api.stopped")
 
 
 app = FastAPI(title="ourkin API", lifespan=lifespan)
 
+# Order matters: RequestLog wraps AuthMiddleware so we get a log line even
+# when auth rejects. AuthMiddleware runs first chronologically because
+# Starlette walks middleware in reverse-add order.
 app.add_middleware(AuthMiddleware)
+app.add_middleware(RequestLogMiddleware)
 
 app.include_router(people.router)
 app.include_router(media.router)

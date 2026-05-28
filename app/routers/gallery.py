@@ -6,16 +6,22 @@ Sort:    actual capture timestamp DESC
 """
 
 import json
-import logging
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, field_validator
 from app.config import settings
 from app.db.neo4j import get_session
+from app.log import logger
 
-log = logging.getLogger(__name__)
 router = APIRouter(prefix="/gallery", tags=["gallery"])
+
+# Local alias so the diff-against-old `log.warning(...)` calls below stay
+# minimal; new code should `from app.log import logger` directly and use
+# `logger.bind(...).info(...)` for structured events.
+log = logger
 
 VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.m4v', '.mpg', '.mpeg'}
 
@@ -123,8 +129,72 @@ async def list_media(
     }
 
 
+class RedateBody(BaseModel):
+    """Manual override of a Media's capture date.
+
+    `timestamp` is a full ISO datetime (we always store the full shape so
+    sort works); `precision` tells the UI how much of it to display + how
+    much to truth-claim. A year-precision edit of "2000" is stored as
+    `2000-01-01T00:00:00-04:00` with `precision='year'` so the UI knows
+    not to render "Jan 1, 2000". TZ is always America/New_York per the
+    project's single-tz policy.
+
+    Re-ingest tooling (`mpp`) MUST honor `timestamp_source = 'manual'`
+    and skip overwriting `m.timestamp` / `m.original_timestamp` — that
+    keeps the user override across imports. (Cross-Claude contract.)
+    """
+    timestamp: str
+    precision: Literal['day', 'month', 'year'] = 'day'
+
+    @field_validator('timestamp')
+    @classmethod
+    def must_be_iso(cls, v: str) -> str:
+        try:
+            datetime.fromisoformat(v.replace('Z', '+00:00'))
+        except ValueError as exc:
+            raise ValueError(f"timestamp must be ISO-8601: {exc}") from exc
+        return v
+
+
+@router.patch("/media")
+async def redate_media(request: Request, path: str = Query(...), body: RedateBody = ...):
+    """Soft redate: overwrite Media.timestamp with a human-curated value,
+    capturing the original on first edit. EXIF + sidecar untouched."""
+    async with get_session() as session:
+        result = await session.run(
+            """
+            MATCH (m:Media {path: $path})
+            SET m.original_timestamp   = coalesce(m.original_timestamp, m.timestamp),
+                m.timestamp            = $timestamp,
+                m.timestamp_source     = 'manual',
+                m.timestamp_confidence = 'high',
+                m.timestamp_precision  = $precision
+            RETURN m { .path, .timestamp, .original_timestamp,
+                       .timestamp_source, .timestamp_confidence,
+                       .timestamp_precision } AS media
+            """,
+            path=path,
+            timestamp=body.timestamp,
+            precision=body.precision,
+        )
+        rec = await result.single()
+        if not rec:
+            raise HTTPException(404, "Media not found")
+    media = rec["media"]
+    logger.bind(
+        event="media.redated",
+        path=path,
+        old_ts=media.get("original_timestamp"),
+        new_ts=media["timestamp"],
+        precision=body.precision,
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("media redated")
+    return media
+
+
 @router.delete("/media", status_code=204)
-async def delete_media(path: str = Query(...)):
+async def delete_media(request: Request, path: str = Query(...)):
     """Remove a Media node and all its edges (face assignments, album
     memberships, favorites, etc.). The underlying file on disk is NOT
     touched — re-importing the path via mpp will recreate the node."""
@@ -135,6 +205,12 @@ async def delete_media(path: str = Query(...)):
         )
         if not await res.single():
             raise HTTPException(404, "Media not found")
+    logger.bind(
+        event="media.deleted",
+        path=path,
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("media deleted")
 
 
 @router.get("/years")
@@ -175,6 +251,8 @@ async def media_detail(path: str = Query(...)):
                 MATCH (person:Person)-[rel:APPEARS_IN]->(p:Media {path: $path})
                 RETURN person.id AS id, person.name AS name,
                        person.known_as AS known_as, person.avatar AS avatar,
+                       person.birth_date AS birth_date,
+                       person.birth_date_precision AS birth_date_precision,
                        rel.face_index AS face_index, rel.crop_path AS crop_path
                 ORDER BY person.name
                 """,
@@ -303,6 +381,17 @@ async def media_detail(path: str = Query(...)):
         media       = meta.get("media", {})
         dims        = media.get("dimensions", {})
         ts          = meta.get("timestamps", {}).get("primary", {})
+
+        # Soft-redate override: when Neo4j flags the timestamp as user-edited,
+        # it wins over the sidecar (sidecar is untouched by redate by design).
+        if media_node.get("timestamp_source") == "manual":
+            ts = {
+                "timestamp":  media_node["timestamp"],
+                "source":     "manual",
+                "confidence": media_node.get("timestamp_confidence", "high"),
+                "precision":  media_node.get("timestamp_precision", "day"),
+            }
+            meta.setdefault("timestamps", {})["primary"] = ts
         loc_block   = meta.get("location", {})
         primary_loc = loc_block.get("primary") or {}
         geoloc      = loc_block.get("geolocation") or {}

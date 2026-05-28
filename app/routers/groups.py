@@ -1,7 +1,16 @@
 import uuid
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from app.db.neo4j import get_session
+from app.log import logger
+
+
+def _ctx(request: Request) -> dict:
+    return {
+        "by": getattr(request.state, "user_email", None),
+        "request_id": getattr(request.state, "request_id", None),
+    }
+
 
 router = APIRouter(prefix="/groups", tags=["groups"])
 
@@ -67,7 +76,7 @@ async def list_groups(type: str | None = None, q: str | None = None):
 
 
 @router.post("/", status_code=201)
-async def create_group(data: GroupCreate):
+async def create_group(data: GroupCreate, request: Request):
     if data.type not in GROUP_TYPES:
         raise HTTPException(400, f"Invalid type. Must be one of: {GROUP_TYPES}")
     async with get_session() as session:
@@ -93,6 +102,13 @@ async def create_group(data: GroupCreate):
             notes=data.notes,
         )
         record = await result.single()
+    logger.bind(
+        event="group.created",
+        group_id=group_id,
+        name=data.name,
+        type=data.type,
+        **_ctx(request),
+    ).info("group created")
     return dict(record["g"])
 
 
@@ -120,7 +136,7 @@ async def get_group(group_id: str):
 
 
 @router.patch("/{group_id}")
-async def update_group(group_id: str, data: GroupCreate):
+async def update_group(group_id: str, data: GroupCreate, request: Request):
     if data.type not in GROUP_TYPES:
         raise HTTPException(400, f"Invalid type")
     async with get_session() as session:
@@ -146,20 +162,27 @@ async def update_group(group_id: str, data: GroupCreate):
         record = await result.single()
         if not record:
             raise HTTPException(404, "Group not found")
+    logger.bind(
+        event="group.updated",
+        group_id=group_id,
+        name=data.name,
+        **_ctx(request),
+    ).info("group updated")
     return dict(record["g"])
 
 
 @router.delete("/{group_id}", status_code=204)
-async def delete_group(group_id: str):
+async def delete_group(group_id: str, request: Request):
     async with get_session() as session:
         await session.run(
             "MATCH (g:Group {id: $id}) DETACH DELETE g",
             id=group_id,
         )
+    logger.bind(event="group.deleted", group_id=group_id, **_ctx(request)).info("group deleted")
 
 
 @router.post("/{group_id}/members", status_code=204)
-async def add_member(group_id: str, body: MemberAdd):
+async def add_member(group_id: str, body: MemberAdd, request: Request):
     async with get_session() as session:
         check = await session.run(
             "MATCH (g:Group {id: $gid}), (p:Person {id: $pid}) RETURN count(*) AS n",
@@ -177,10 +200,17 @@ async def add_member(group_id: str, body: MemberAdd):
             gid=group_id, pid=body.person_id,
             role=body.role, since=body.since, until=body.until,
         )
+    logger.bind(
+        event="group.member.added",
+        group_id=group_id,
+        person_id=body.person_id,
+        role=body.role,
+        **_ctx(request),
+    ).info("group member added")
 
 
 @router.delete("/{group_id}/members/{person_id}", status_code=204)
-async def remove_member(group_id: str, person_id: str):
+async def remove_member(group_id: str, person_id: str, request: Request):
     async with get_session() as session:
         await session.run(
             """
@@ -189,6 +219,12 @@ async def remove_member(group_id: str, person_id: str):
             """,
             gid=group_id, pid=person_id,
         )
+    logger.bind(
+        event="group.member.removed",
+        group_id=group_id,
+        person_id=person_id,
+        **_ctx(request),
+    ).info("group member removed")
 
 
 @router.get("/{group_id}/connection/{other_id}")
