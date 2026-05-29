@@ -3,5 +3,7 @@ uvicorn[standard]
 neo4j
 pydantic-settings
 numpy
+scipy
 Pillow
+python-multipart
 loguru
