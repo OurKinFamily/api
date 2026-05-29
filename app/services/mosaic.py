@@ -121,7 +121,20 @@ def _make_hex_mask(w: int, h: int) -> Image.Image:
     return mask
 
 
-async def fetch_pool(color_source: str, person_ids: list[str] | None = None) -> list[dict]:
+async def fetch_pool(
+    color_source: str,
+    person_ids: list[str] | None = None,
+    exclude_person_ids: list[str] | None = None,
+) -> list[dict]:
+    """Pull candidate tiles.
+
+    `person_ids` = whitelist. Only Media where AT LEAST ONE of these people
+    appears (logical OR). Empty/None means "everyone".
+
+    `exclude_person_ids` = blacklist. Media where ANY excluded person
+    appears is dropped (logical AND). Lets the caller say "only photos
+    of Cayce and Stephen, but not if Henry is also in frame".
+    """
     prop = PROP_BY_SOURCE[color_source]
     async with get_session() as s:
         if person_ids:
@@ -130,20 +143,32 @@ async def fetch_pool(color_source: str, person_ids: list[str] | None = None) -> 
                 MATCH (p:Person)-[:APPEARS_IN]->(m:Media)
                 WHERE p.id IN $ids
                   AND m.{prop} IS NOT NULL AND size(m.{prop}) = 7
+                  AND ($exclude IS NULL OR size($exclude) = 0
+                       OR NOT EXISTS {{
+                         MATCH (px:Person)-[:APPEARS_IN]->(m)
+                         WHERE px.id IN $exclude
+                       }})
                 RETURN DISTINCT m.path AS path, m.{prop} AS color,
                        m.luminance_stddev AS contrast,
                        m.best_crop_quadrant AS quad
                 """,
                 ids=person_ids,
+                exclude=exclude_person_ids or [],
             )
         else:
             res = await s.run(
                 f"""
                 MATCH (m:Media) WHERE m.{prop} IS NOT NULL AND size(m.{prop}) = 7
+                  AND ($exclude IS NULL OR size($exclude) = 0
+                       OR NOT EXISTS {{
+                         MATCH (px:Person)-[:APPEARS_IN]->(m)
+                         WHERE px.id IN $exclude
+                       }})
                 RETURN m.path AS path, m.{prop} AS color,
                        m.luminance_stddev AS contrast,
                        m.best_crop_quadrant AS quad
-                """
+                """,
+                exclude=exclude_person_ids or [],
             )
         return [
             {

@@ -1341,9 +1341,10 @@ async def mosaic_render(
     tile_size:   int = Form(48),
     color:       str = Form("mean"),
     max_reuse:   int = Form(8),
-    shape:          str = Form("square"),
-    person_ids:     str = Form(""),
-    color_distance: str = Form("lab"),
+    shape:              str = Form("square"),
+    person_ids:         str = Form(""),
+    exclude_person_ids: str = Form(""),
+    color_distance:     str = Form("lab"),
     edge_aware:     bool = Form(False),
     source_smooth:  int  = Form(1),
     crop:           str  = Form("center"),
@@ -1380,7 +1381,8 @@ async def mosaic_render(
         "edge_aware":     edge_aware,
         "source_smooth":  source_smooth,
         "crop":           crop,
-        "person_ids":     [s.strip() for s in person_ids.split(",") if s.strip()] if person_ids else [],
+        "person_ids":         [s.strip() for s in person_ids.split(",") if s.strip()] if person_ids else [],
+        "exclude_person_ids": [s.strip() for s in exclude_person_ids.split(",") if s.strip()] if exclude_person_ids else [],
     }
     log.bind(event="mosaic.render.started", **params).info("mosaic render started")
 
@@ -1402,8 +1404,9 @@ async def mosaic_render(
         else:
             raise HTTPException(400, "provide either `source` (upload) or `source_path` (archive path)")
 
-        ids_list = [s.strip() for s in person_ids.split(",") if s.strip()] if person_ids else None
-        pool = await mosaic_svc.fetch_pool(color, person_ids=ids_list)
+        ids_list    = [s.strip() for s in person_ids.split(",") if s.strip()] if person_ids else None
+        exclude_ids = [s.strip() for s in exclude_person_ids.split(",") if s.strip()] if exclude_person_ids else None
+        pool = await mosaic_svc.fetch_pool(color, person_ids=ids_list, exclude_person_ids=exclude_ids)
         if not pool:
             raise HTTPException(400, "no candidate tiles for the chosen filters")
 
