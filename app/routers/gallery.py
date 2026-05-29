@@ -195,19 +195,59 @@ async def redate_media(request: Request, path: str = Query(...), body: RedateBod
 
 @router.delete("/media", status_code=204)
 async def delete_media(request: Request, path: str = Query(...)):
-    """Remove a Media node and all its edges (face assignments, album
-    memberships, favorites, etc.). The underlying file on disk is NOT
-    touched — re-importing the path via mpp will recreate the node."""
+    """Soft-delete a Media node + its file + all sidecar siblings. The
+    file and its `.json` / `.faces.json` / `.objects.json` / `.poster.jpg`
+    / `.srt` / `.txt` / `_plain.txt` companions all move to
+    `/photos/trash/<original-subpath>/` so the disk-report's drift
+    detection stops flagging them as "unindexed", and they can be
+    restored by moving them back. The Neo4j node is detached + deleted.
+    """
+    from pathlib import Path
+    src = settings.photos_root / path
+    trash_root = settings.photos_root / "trash"
+
+    moved: list[str] = []
+    file_existed = src.exists()
+    if file_existed:
+        dst = trash_root / path
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            src.rename(dst)
+            moved.append(path)
+        except OSError as e:
+            raise HTTPException(500, f"could not move file to trash: {e}")
+        # All known sidecar siblings live next to the main file with the
+        # same stem + a known suffix. Move whichever exist.
+        SIDECARS = [
+            '.json', '.objects.json', '.clip.json', '.scenes.json',
+            '.faces.json', '.srt', '.txt', '.poster.jpg', '_plain.txt',
+        ]
+        for suf in SIDECARS:
+            side_src = Path(str(src) + suf)
+            if side_src.exists():
+                side_dst = Path(str(dst) + suf)
+                try:
+                    side_src.rename(side_dst)
+                    moved.append(str(side_src.relative_to(settings.photos_root)))
+                except OSError:
+                    pass  # don't fail the whole delete on a stray sidecar
+
     async with get_session() as session:
         res = await session.run(
             "MATCH (m:Media {path: $path}) DETACH DELETE m RETURN 1 AS ok",
             path=path,
         )
-        if not await res.single():
-            raise HTTPException(404, "Media not found")
+        node_existed = bool(await res.single())
+
+    if not node_existed and not file_existed:
+        raise HTTPException(404, "Media not found in graph or on disk")
+
     logger.bind(
         event="media.deleted",
         path=path,
+        moved_to_trash=moved,
+        node_existed=node_existed,
+        file_existed=file_existed,
         by=getattr(request.state, "user_email", None),
         request_id=getattr(request.state, "request_id", None),
     ).info("media deleted")
