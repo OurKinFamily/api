@@ -12,7 +12,7 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, field_validator
-from app.config import settings
+from app.config import settings, with_v
 from app.db.neo4j import get_session
 from app.log import logger
 
@@ -102,13 +102,13 @@ async def list_media(
         path = p.get("path", "")
         # heritage videos carry a poster jpg; regular media use the webp thumb route
         poster = p.get("poster_path")
-        thumbnail_url = (
+        thumbnail_url = with_v(
             f"/api/media/{poster}" if poster
             else f"/api/media/thumb/{path.removeprefix('archive/')}"
         )
         photos.append({
             "path":           path,
-            "url":            f"/api/media/{path}",
+            "url":            with_v(f"/api/media/{path}"),
             "thumbnail_url":  thumbnail_url,
             "filename":       p.get("filename") or Path(path).name,
             "timestamp":      p.get("timestamp"),
@@ -318,8 +318,8 @@ async def media_detail(path: str = Query(...)):
     if media_node.get("audio_file"):
         audio_rel = f"{Path(path).parent}/{media_node['audio_file']}"
         if (settings.photos_root / audio_rel).exists():
-            audio_url = f"/api/media/{audio_rel}"
-    subtitle_url = f"/api/media/vtt/{path}" if media_node.get("has_subtitles") else None
+            audio_url = with_v(f"/api/media/{audio_rel}")
+    subtitle_url = with_v(f"/api/media/vtt/{path}") if media_node.get("has_subtitles") else None
     heritage = {
         "content_date":             media_node.get("content_date"),
         "content_date_precision":   media_node.get("content_date_precision"),
@@ -367,7 +367,7 @@ async def media_detail(path: str = Query(...)):
             bbox_by_index = {f["face_index"]: f.get("bbox") for f in fd.get("faces", [])}
             for p in people:
                 p["bbox"]     = bbox_by_index.get(p.get("face_index"))
-                p["crop_url"] = f"/api/media/{p['crop_path']}" if p.get("crop_path") else None
+                p["crop_url"] = with_v(f"/api/media/{p['crop_path']}") if p.get("crop_path") else None
 
             # Derive crop paths for faces not yet assigned to anyone
             assigned_indexes = {p.get("face_index") for p in people}
@@ -384,7 +384,7 @@ async def media_detail(path: str = Query(...)):
                         "face_index": fi,
                         "bbox":       face.get("bbox"),
                         "crop_path":  crop_path,
-                        "crop_url":   f"/api/media/{crop_path}",
+                        "crop_url":   with_v(f"/api/media/{crop_path}"),
                         "confidence": face.get("confidence"),
                     })
         except Exception as e:

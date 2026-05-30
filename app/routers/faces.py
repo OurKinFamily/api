@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from app.config import settings
+from app.config import settings, with_v
 from app.db.neo4j import get_session
 from app.log import logger as log
 
@@ -109,7 +109,7 @@ def _save(path: Path, data):
 
 def _crop_url(crop_path: str) -> str:
     rel = crop_path.replace("/photos/", "", 1) if crop_path.startswith("/photos/") else crop_path
-    return f"/api/media/{rel}"
+    return with_v(f"/api/media/{rel}")
 
 
 async def _get_neo4j_assigned() -> set[tuple[str, int]]:
@@ -230,7 +230,7 @@ def _run_similarity_search(matrix, meta, q, threshold, limit, assigned, exclude:
         if assigned and key in assigned:
             continue
         crop = m.get("crop_path", "")
-        crop_url = f"/api/media/{crop.replace('/photos/', '', 1)}" if crop.startswith("/photos/") else f"/api/media/{crop}"
+        crop_url = with_v(f"/api/media/{crop.replace('/photos/', '', 1)}") if crop.startswith("/photos/") else with_v(f"/api/media/{crop}")
         results.append({
             "photo_path":  rel_path,
             "face_index":  m["face_index"],
@@ -510,7 +510,7 @@ async def search_similar_faces_temporal(body: SearchByPersonTemporalBody):
                 continue
             if key not in best or sim > best[key]["similarity"]:
                 crop = m.get("crop_path", "")
-                crop_url = f"/api/media/{crop.replace('/photos/', '', 1)}" if crop.startswith("/photos/") else f"/api/media/{crop}"
+                crop_url = with_v(f"/api/media/{crop.replace('/photos/', '', 1)}") if crop.startswith("/photos/") else with_v(f"/api/media/{crop}")
                 best[key] = {
                     "photo_path": rel,
                     "face_index": m["face_index"],

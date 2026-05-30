@@ -72,7 +72,10 @@ def build_command(job: dict, params: dict) -> str:
         name = p["name"]
         val  = params.get(name, p.get("default", ""))
         if p["type"] == "flag":
-            subs[name] = p["flag"] if val else ""
+            on = bool(val)
+            if p.get("invert"):
+                on = not on  # emit the flag when checkbox is OFF
+            subs[name] = p["flag"] if on else ""
         else:
             subs[name] = str(val) if val is not None else ""
     return job["shell_command"].format(**subs)

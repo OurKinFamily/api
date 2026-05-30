@@ -5,6 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
+from app.config import with_v
 from app.db.neo4j import get_session
 from app.log import logger
 from app.services import mosaic as mosaic_svc
@@ -625,7 +626,7 @@ async def hue_samples(hue: str, limit: int = 24, source: str = "dominant"):
         p = (r["path"] or "").removeprefix("archive/")
         samples.append({
             "path":      r["path"],
-            "thumb_url": f"/api/media/thumb/{p}" if p else None,
+            "thumb_url": with_v(f"/api/media/thumb/{p}") if p else None,
             "color":     r["color"],
             "timestamp": str(r["ts"]) if r["ts"] is not None else None,
         })
@@ -774,7 +775,7 @@ async def _samples_for(filter_prefix: str, params: dict, limit: int = 48) -> lis
         p = (r["path"] or "").removeprefix("archive/")
         samples.append({
             "path":      r["path"],
-            "thumb_url": f"/api/media/thumb/{p}" if p else None,
+            "thumb_url": with_v(f"/api/media/thumb/{p}") if p else None,
             "color":     r["color"],
             "timestamp": str(r["ts"]) if r["ts"] is not None else None,
         })

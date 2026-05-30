@@ -6,6 +6,7 @@ operate on the logged-in user's data — favorites, preferences, etc.
 """
 import os
 from fastapi import APIRouter, HTTPException, Request, Query
+from app.config import with_v
 from app.db.neo4j import get_session
 from app.log import logger
 
@@ -90,7 +91,7 @@ async def favorites(request: Request, limit: int = 100, offset: int = 0):
             "dominant_color": row["dominant_color"],
             "is_video":       (row["kind"] == "video"),
             "favorited_at":   row["favorited_at"],
-            "thumbnail_url":  f"/api/media/thumb/{(row['path'] or '').removeprefix('archive/')}",
+            "thumbnail_url":  with_v(f"/api/media/thumb/{(row['path'] or '').removeprefix('archive/')}"),
         }
         for row in rows
     ]

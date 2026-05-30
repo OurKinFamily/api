@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.db.neo4j import get_session
-from app.config import settings
+from app.config import settings, with_v
 from app.log import logger
 
 
@@ -51,19 +51,19 @@ def _item_from_node(d: dict) -> dict:
     if d.get("audio_file"):
         audio_rel = f"{Path(path).parent}/{d['audio_file']}"
         if (PHOTOS_ROOT / audio_rel).exists():
-            audio_url = f"/api/media/{audio_rel}"
+            audio_url = with_v(f"/api/media/{audio_rel}")
 
     # videos use their poster jpg as the thumbnail; images use the webp thumb route
     if is_video and d.get("poster_path"):
-        thumb_url = f"/api/media/{d['poster_path']}"
+        thumb_url = with_v(f"/api/media/{d['poster_path']}")
     else:
-        thumb_url = f"/api/media/thumb/{path}"
+        thumb_url = with_v(f"/api/media/thumb/{path}")
 
-    subtitle_url = f"/api/media/vtt/{path}" if d.get("has_subtitles") else None
+    subtitle_url = with_v(f"/api/media/vtt/{path}") if d.get("has_subtitles") else None
 
     return {
         "path": path,
-        "url": f"/api/media/{path}",
+        "url": with_v(f"/api/media/{path}"),
         "thumb_url": thumb_url,
         "is_video": is_video,
         "subtitle_url": subtitle_url,

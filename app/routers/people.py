@@ -1,6 +1,7 @@
 import uuid
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
+from app.config import with_v
 from app.db.neo4j import get_session
 from app.log import logger
 from app.models.person import Person, PersonCreate, RelationshipAdd
@@ -703,7 +704,7 @@ def _life_stage_score(p):
 
 
 def _life_stage_tile(label, chosen, age_years, count, locked):
-    thumb_url = (
+    thumb_url = with_v(
         f"/api/media/{chosen['poster_path']}"
         if chosen.get("is_video") and chosen.get("poster_path")
         else f"/api/media/thumb/{chosen['path']}"
@@ -713,9 +714,9 @@ def _life_stage_tile(label, chosen, age_years, count, locked):
         "bucket": label,
         "age_text": _format_age(age_years),
         "path": chosen["path"],
-        "url": f"/api/media/{chosen['path']}",
+        "url": with_v(f"/api/media/{chosen['path']}"),
         "thumb_url": thumb_url,
-        "crop_url": f"/api/media/{crop_path}" if crop_path else None,
+        "crop_url": with_v(f"/api/media/{crop_path}") if crop_path else None,
         "is_video": bool(chosen.get("is_video")),
         "count": count,
         "locked": locked,

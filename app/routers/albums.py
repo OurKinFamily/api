@@ -12,6 +12,7 @@ import os
 import uuid
 from fastapi import APIRouter, HTTPException, Request, Query
 from pydantic import BaseModel
+from app.config import with_v
 from app.db.neo4j import get_session
 from app.log import logger
 
@@ -188,7 +189,7 @@ async def get_album(album_id: str, request: Request, limit: int = 500, offset: i
             "dominant_color": r["dominant_color"],
             "is_video":       (r["kind"] == "video"),
             "added_at":       r["added_at"],
-            "thumbnail_url":  f"/api/media/thumb/{(r['path'] or '').removeprefix('archive/')}",
+            "thumbnail_url":  with_v(f"/api/media/thumb/{(r['path'] or '').removeprefix('archive/')}"),
         }
         for r in rows
     ]

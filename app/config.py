@@ -15,3 +15,16 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+# Browser cache-bust token for /api/media/* URLs. Bump in lockstep with the
+# frontend constant in app/src/lib/media.js after regenerating thumbs/medium.
+MEDIA_VERSION = 1
+
+
+def with_v(url: str | None) -> str | None:
+    """Append ?v=MEDIA_VERSION (or &v=) to a /api/media/* URL for cache busting."""
+    if not url:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}v={MEDIA_VERSION}"

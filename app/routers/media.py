@@ -8,6 +8,10 @@ from app.config import settings
 
 router = APIRouter(prefix="/media", tags=["media"])
 
+# Bump frontend MEDIA_VERSION (app/src/lib/media.js) to invalidate browser caches
+# after a thumb regen. URLs are immutable for 7d unless ?v= changes.
+CACHE_HEADERS = {"Cache-Control": "public, max-age=604800, immutable"}
+
 THUMBS_ROOT = settings.photos_root / "__thumbs"
 # /photos is mounted read-only in container, so on-demand caches live in
 # writable temp dirs. Lost on container restart — acceptable.
@@ -34,7 +38,7 @@ async def serve_thumb(path: str):
     except ValueError:
         raise HTTPException(status_code=403, detail="Forbidden")
     if thumb.exists():
-        return FileResponse(thumb, media_type="image/webp")
+        return FileResponse(thumb, media_type="image/webp", headers=CACHE_HEADERS)
 
     # Resolve source under photos_root. Archive paths arrive with the
     # "archive/" prefix stripped (gallery convention); other trees like
@@ -53,7 +57,7 @@ async def serve_thumb(path: str):
     if src is not None:
         poster = src.parent / (src.name + ".poster.jpg")
         if poster.exists():
-            return FileResponse(poster, media_type="image/jpeg")
+            return FileResponse(poster, media_type="image/jpeg", headers=CACHE_HEADERS)
 
     # Fallback 2: image missing a webp thumb — generate on-demand, cache to /tmp.
     if src is not None and src.suffix.lower() in IMAGE_EXTS:
@@ -63,7 +67,7 @@ async def serve_thumb(path: str):
         except ValueError:
             raise HTTPException(status_code=403, detail="Forbidden")
         if cached.exists():
-            return FileResponse(cached, media_type="image/webp")
+            return FileResponse(cached, media_type="image/webp", headers=CACHE_HEADERS)
         from PIL import Image, ImageOps
         try:
             img = Image.open(src)
@@ -73,7 +77,7 @@ async def serve_thumb(path: str):
             img.convert("RGB").save(cached, "WEBP", quality=80)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"thumb gen failed: {e}")
-        return FileResponse(cached, media_type="image/webp")
+        return FileResponse(cached, media_type="image/webp", headers=CACHE_HEADERS)
 
     raise HTTPException(status_code=404, detail="Thumbnail not found")
 
@@ -103,7 +107,7 @@ async def serve_medium(path: str):
     except ValueError:
         raise HTTPException(status_code=403, detail="Forbidden")
     if cached.exists():
-        return FileResponse(cached, media_type="image/webp")
+        return FileResponse(cached, media_type="image/webp", headers=CACHE_HEADERS)
 
     src = (settings.photos_root / path).resolve()
     try:
@@ -122,7 +126,7 @@ async def serve_medium(path: str):
         img.convert("RGB").save(cached, "WEBP", quality=85)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"resize failed: {e}")
-    return FileResponse(cached, media_type="image/webp")
+    return FileResponse(cached, media_type="image/webp", headers=CACHE_HEADERS)
 
 
 @router.get("/{path:path}")
@@ -134,4 +138,4 @@ async def serve_media(path: str):
         full_path.resolve().relative_to(settings.photos_root.resolve())
     except ValueError:
         raise HTTPException(status_code=403, detail="Forbidden")
-    return FileResponse(full_path)
+    return FileResponse(full_path, headers=CACHE_HEADERS)

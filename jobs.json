@@ -2,10 +2,10 @@
   {
     "id": "faces-extract",
     "name": "Face Detection",
-    "description": "Detect faces, write .faces.json sidecars",
+    "description": "Detect faces in images and videos, write .faces.json sidecars",
     "color": "#8b5cf6",
-    "whenToRun": "STEP 1 of the face pipeline. Run after dropping new photos into /photos/archive. Opens each photo, finds faces, writes a .faces.json sidecar next to it. Without this, the new photos have no faces detected. Fast on small paths — narrow to a year/month dir for incremental runs. Use --force only if you want to redo sidecars that already exist (rare).",
-    "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python extract_faces.py {path} {force}",
+    "whenToRun": "STEP 1 of the face pipeline. Run after dropping new photos/videos into /photos/archive. Opens each file, finds faces, writes a .faces.json sidecar next to it. Videos are sampled at N frames and faces deduped across frames. Without this, new media has no faces detected. Narrow to a year/month dir for incremental runs. Use --force only if you want to redo sidecars that already exist (rare).",
+    "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python extract_faces.py {path} {recursive} {force} --model {model} --frames {frames} --dedup-threshold {dedup_threshold}",
     "params": [
       {
         "name": "path",
@@ -16,36 +16,82 @@
         "hint": "Directory or single file to scan."
       },
       {
+        "name": "recursive",
+        "label": "Recursive",
+        "type": "flag",
+        "flag": "--recursive",
+        "default": true,
+        "hint": "Scan subdirectories. Required if pointing at /photos/archive (year subdirs)."
+      },
+      {
         "name": "force",
         "label": "Force re-run",
         "type": "flag",
         "flag": "--force",
         "default": false,
         "hint": "Re-extract even if sidecar already exists."
+      },
+      {
+        "name": "model",
+        "label": "Model",
+        "type": "text",
+        "default": "buffalo_l",
+        "hint": "InsightFace model: buffalo_l (large, accurate) or buffalo_s (small, fast)."
+      },
+      {
+        "name": "frames",
+        "label": "Video frames",
+        "type": "text",
+        "default": "8",
+        "hint": "Frames sampled per video. More = catches more faces but slower."
+      },
+      {
+        "name": "dedup_threshold",
+        "label": "Video dedup threshold",
+        "type": "text",
+        "default": "0.6",
+        "hint": "Cosine similarity above which two faces from different frames are merged. Lower = more aggressive dedup."
       }
     ]
   },
   {
     "id": "faces-cluster",
     "name": "Face Clustering",
-    "description": "Run DBSCAN on .faces.json embeddings, write clusters.json",
+    "description": "Run DBSCAN on .faces.json embeddings, write clusters.json, auto-assign to known people",
     "color": "#6366f1",
     "whenToRun": "STEP 3 of the face pipeline. Run after Face Detection if you want new faces to surface on /manage/faces/unassigned. Groups all face embeddings into clusters (Stephen's faces in one bucket, Patty's in another, etc.). Without this, new faces are detected but never appear as something you can label. Safe to re-run — assigned + skipped faces are tracked in Neo4j separately and get filtered out automatically, so re-clustering won't lose work. ~1 minute.",
-    "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python cluster_faces.py --eps {eps} --min-samples {min_samples}",
+    "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python cluster_faces.py --eps {eps} --min-samples {min_samples} --threshold {threshold} {auto_assign}",
     "params": [
       {
         "name": "eps",
         "label": "DBSCAN eps",
         "type": "text",
         "default": "0.3",
-        "hint": "Max cosine distance within a cluster (0.0–1.0). Lower = stricter. 0.3 is current production setting."
+        "hint": "Max cosine distance within a cluster (0.0–1.0). Lower = stricter / smaller / purer clusters. 0.3 is current production setting; try 0.27 if mega-clusters merge multiple people."
       },
       {
         "name": "min_samples",
         "label": "Min samples",
         "type": "text",
         "default": "3",
-        "hint": "Minimum faces to form a cluster."
+        "hint": "Minimum faces to form a cluster. Higher = fewer but bigger clusters; faces below threshold go to noise (-1)."
+      },
+      {
+        "name": "auto_assign",
+        "label": "Auto-assign?",
+        "type": "flag",
+        "flag": "--skip-assign",
+        "invert": true,
+        "default": false,
+        "hint": "Check to run auto_assign after clustering — assigns clusters to known people based on face_gallery overlap. Off by default to avoid touching assignments.json when re-tuning eps."
+      },
+      {
+        "name": "threshold",
+        "label": "Auto-assign threshold",
+        "type": "text",
+        "default": "0.85",
+        "show_if": { "name": "auto_assign", "equals": true },
+        "hint": "Fraction of a cluster that must match a known person's face_gallery for auto-assign. 0.0–1.0 (0.85 = 85%). Higher = stricter (fewer false matches, fewer auto-assigns). Lower = more aggressive."
       }
     ]
   },
@@ -61,10 +107,10 @@
   {
     "id": "objects-detect",
     "name": "Object Detection",
-    "description": "Run YOLO on archive, write .objects.json sidecars",
+    "description": "Run YOLO on archive (images + videos), write .objects.json sidecars",
     "color": "#f59e0b",
-    "whenToRun": "Run after dropping new photos into /photos/archive. Writes a .objects.json sidecar listing every detected object (people, animals, vehicles, etc.) with bounding boxes. Independent of the face pipeline — no need to run before/after. Narrow the path for incremental runs.",
-    "shell_command": "cd /home/stephen/photo-intelligence/services/object-detection && source venv/bin/activate && python detect_objects.py {path} --recursive {force}",
+    "whenToRun": "Run after dropping new photos/videos into /photos/archive. Writes a .objects.json sidecar listing every detected object (people, animals, vehicles, etc.) with bounding boxes. Independent of the face pipeline — no need to run before/after. Narrow the path for incremental runs.",
+    "shell_command": "cd /home/stephen/photo-intelligence/services/object-detection && source venv/bin/activate && python detect_objects.py {path} {recursive} {force} --model {model} --confidence {confidence} --frames {frames}",
     "params": [
       {
         "name": "path",
@@ -75,12 +121,41 @@
         "hint": "Directory or single file to scan."
       },
       {
+        "name": "recursive",
+        "label": "Recursive",
+        "type": "flag",
+        "flag": "--recursive",
+        "default": true,
+        "hint": "Scan subdirectories."
+      },
+      {
         "name": "force",
         "label": "Force re-run",
         "type": "flag",
         "flag": "--force",
         "default": false,
         "hint": "Re-detect even if sidecar already exists."
+      },
+      {
+        "name": "model",
+        "label": "YOLO model",
+        "type": "text",
+        "default": "yolov8n.pt",
+        "hint": "YOLO weights file (n=nano, s=small, m=medium, l=large, x=xlarge). Larger = slower but more accurate."
+      },
+      {
+        "name": "confidence",
+        "label": "Min confidence",
+        "type": "text",
+        "default": "0.25",
+        "hint": "Detection confidence threshold (0.0-1.0). Lower = more detections, more false positives."
+      },
+      {
+        "name": "frames",
+        "label": "Video frames",
+        "type": "text",
+        "default": "8",
+        "hint": "Frames sampled per video for detection."
       }
     ]
   },
@@ -90,7 +165,7 @@
     "description": "Extract CLIP semantic embeddings, write .clip.json sidecars",
     "color": "#06b6d4",
     "whenToRun": "Run after dropping new photos into /photos/archive. Writes a .clip.json sidecar with a semantic embedding per image — used for natural-language search (\"dog at beach\", \"birthday cake\"). Independent of the face / object pipelines. Narrow the path for incremental runs.",
-    "shell_command": "cd /home/stephen/photo-intelligence/services/content-understanding && source venv/bin/activate && python extract_clip.py {path} --recursive {force}",
+    "shell_command": "cd /home/stephen/photo-intelligence/services/content-understanding && source venv/bin/activate && python extract_clip.py {path} {recursive} {force} --model {model}",
     "params": [
       {
         "name": "path",
@@ -101,12 +176,27 @@
         "hint": "Directory or single file to scan."
       },
       {
+        "name": "recursive",
+        "label": "Recursive",
+        "type": "flag",
+        "flag": "--recursive",
+        "default": true,
+        "hint": "Scan subdirectories."
+      },
+      {
         "name": "force",
         "label": "Force re-run",
         "type": "flag",
         "flag": "--force",
         "default": false,
         "hint": "Re-extract even if sidecar already exists."
+      },
+      {
+        "name": "model",
+        "label": "CLIP model",
+        "type": "text",
+        "default": "ViT-B/32",
+        "hint": "CLIP variant: ViT-B/32 (fast), ViT-B/16, ViT-L/14 (slow, accurate)."
       }
     ]
   },
@@ -116,7 +206,7 @@
     "description": "Extract DINOv2 scene embeddings, write .scenes.json sidecars",
     "color": "#10b981",
     "whenToRun": "Run after dropping new photos into /photos/archive. Writes a .scenes.json sidecar with a DINOv2 scene embedding — used for visual-similarity search (\"more photos that LOOK like this one\", regardless of subject). Independent of other pipelines. Narrow the path for incremental runs.",
-    "shell_command": "cd /home/stephen/photo-intelligence/services/scene-recognition && source venv/bin/activate && python extract_scenes.py {path} --recursive {force}",
+    "shell_command": "cd /home/stephen/photo-intelligence/services/scene-recognition && source venv/bin/activate && python extract_scenes.py {path} {recursive} {force} --model {model}",
     "params": [
       {
         "name": "path",
@@ -127,12 +217,27 @@
         "hint": "Directory or single file to scan."
       },
       {
+        "name": "recursive",
+        "label": "Recursive",
+        "type": "flag",
+        "flag": "--recursive",
+        "default": true,
+        "hint": "Scan subdirectories."
+      },
+      {
         "name": "force",
         "label": "Force re-run",
         "type": "flag",
         "flag": "--force",
         "default": false,
         "hint": "Re-extract even if sidecar already exists."
+      },
+      {
+        "name": "model",
+        "label": "DINOv2 model",
+        "type": "text",
+        "default": "dinov2_vitg14",
+        "hint": "DINOv2 variant: dinov2_vits14 (small), dinov2_vitb14, dinov2_vitl14, dinov2_vitg14 (giant)."
       }
     ]
   },
@@ -142,7 +247,38 @@
     "description": "Scan archive metadata and regenerate report.json for Admin Overview",
     "color": "#64748b",
     "whenToRun": "Run when the /admin/overview page numbers look stale — e.g. after a big import or after any of the extractor jobs above finish. Scans every file's metadata and recounts coverage stats. ~couple minutes. Safe to run any time.",
-    "shell_command": "cd /home/stephen/photo-intelligence && python mm.py report -v -o /photos/__data/status/report.txt",
-    "params": []
+    "shell_command": "cd /home/stephen/photo-intelligence && python mm.py report {path} {summary} {verbose} -o {output}",
+    "params": [
+      {
+        "name": "path",
+        "label": "Target path",
+        "type": "text",
+        "default": "/photos/archive",
+        "hint": "Directory to scan (default: full archive). Narrow to a year for faster incremental reports."
+      },
+      {
+        "name": "output",
+        "label": "Output file",
+        "type": "text",
+        "default": "/photos/__data/status/report.txt",
+        "hint": "Path to write the .txt report. A sibling .json is also written automatically."
+      },
+      {
+        "name": "summary",
+        "label": "Summary only",
+        "type": "flag",
+        "flag": "-s",
+        "default": false,
+        "hint": "Only print summary tables — skip per-file lists."
+      },
+      {
+        "name": "verbose",
+        "label": "Verbose",
+        "type": "flag",
+        "flag": "-v",
+        "default": true,
+        "hint": "Show scan progress."
+      }
+    ]
   }
 ]
