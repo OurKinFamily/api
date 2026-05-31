@@ -4,7 +4,7 @@ from app.db.neo4j import init_driver, close_driver
 from app.log import logger
 from app.middleware.auth import AuthMiddleware
 from app.middleware.request_log import RequestLogMiddleware
-from app.routers import people, media, jobs, gallery, faces, admin, places, groups, suggestions, heritage, me, albums
+from app.routers import people, media, jobs, gallery, faces, admin, places, groups, suggestions, heritage, me, albums, search
 
 
 @asynccontextmanager
@@ -37,3 +37,4 @@ app.include_router(suggestions.router)
 app.include_router(heritage.router)
 app.include_router(me.router)
 app.include_router(albums.router)
+app.include_router(search.router)

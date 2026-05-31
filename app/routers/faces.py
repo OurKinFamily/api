@@ -112,6 +112,40 @@ def _crop_url(crop_path: str) -> str:
     return with_v(f"/api/media/{rel}")
 
 
+# Small in-process cache for person_id → display name, used to enrich log
+# events so Grafana panels can show real names instead of UUIDs.
+_person_name_cache: dict[str, str] = {}
+
+
+async def _get_person_name(person_id: str, session=None) -> str:
+    """Look up Person.name by id, with a tiny in-process cache. Falls back
+    to the id itself if not found. `session` is optional — pass an open one
+    to reuse it, otherwise a fresh session is created."""
+    if not person_id:
+        return ""
+    if person_id in _person_name_cache:
+        return _person_name_cache[person_id]
+    try:
+        if session is None:
+            async with get_session() as s:
+                res = await s.run(
+                    "MATCH (p:Person {id: $id}) RETURN p.name AS name LIMIT 1",
+                    id=person_id,
+                )
+                row = await res.single()
+        else:
+            res = await session.run(
+                "MATCH (p:Person {id: $id}) RETURN p.name AS name LIMIT 1",
+                id=person_id,
+            )
+            row = await res.single()
+        name = (row and row["name"]) or person_id
+    except Exception:
+        name = person_id
+    _person_name_cache[person_id] = name
+    return name
+
+
 async def _get_neo4j_assigned() -> set[tuple[str, int]]:
     """All (photo_path, face_index) pairs with any APPEARS_IN in Neo4j. 60s cache."""
     import time
@@ -599,9 +633,11 @@ async def bulk_assign_faces(body: dict, request: Request):
     by = getattr(request.state, "user_email", None)
     request_id = getattr(request.state, "request_id", None)
     bulk_id = uuid.uuid4().hex[:12]
+    person_name = await _get_person_name(person_id)
     log.bind(
         event="face.bulk_assign.started",
         person_id=person_id,
+        person_name=person_name,
         count=len(faces),
         bulk_id=bulk_id,
         by=by,
@@ -651,6 +687,7 @@ async def bulk_assign_faces(body: dict, request: Request):
             log.bind(
                 event="face.assigned",
                 person_id=person_id,
+                person_name=person_name,
                 photo_path=photo_path,
                 face_index=face_index,
                 crop_path=crop_path,
@@ -687,9 +724,11 @@ async def unassign_face(request: Request, person_id: str, photo_path: str, face_
     global _neo4j_assigned
     _neo4j_assigned = None
 
+    person_name = await _get_person_name(person_id)
     log.bind(
         event="face.unassigned",
         person_id=person_id,
+        person_name=person_name,
         photo_path=pp,
         face_index=face_index,
         by=getattr(request.state, "user_email", None),
@@ -952,10 +991,12 @@ async def assign_cluster(cluster_id: str, body: AssignBody, request: Request):
         daemon=True,
     ).start()
 
+    person_name = await _get_person_name(body.person_id)
     log.bind(
         event="cluster.assigned",
         cluster_id=cluster_id,
         person_id=body.person_id,
+        person_name=person_name,
         count=len(faces),
         excluded=len(body.exclude or []),
         by=getattr(request.state, "user_email", None),
