@@ -22,6 +22,7 @@ CLUSTERS_FILE           = CLUSTERS_DIR / "clusters.json"
 SKIPPED_FILE            = CLUSTERS_DIR / "skipped.json"
 EMBEDDINGS_NPY          = CLUSTERS_DIR / "embeddings.npy"
 FACES_META_FILE         = CLUSTERS_DIR / "faces_meta.json"
+BRAIN_DIR               = settings.photos_root / "__faces" / "brain"
 
 # In-memory embedding index (lazy-loaded)
 _emb_matrix   = None
@@ -37,6 +38,95 @@ _neo4j_skipped: set[tuple[str, int]] | None = None
 _neo4j_skipped_ts: float = 0.0
 _NEO4J_SKIPPED_TTL = 60.0  # seconds
 _emb_lock     = threading.Lock()
+
+# Brain (per-person multi-centroid identity model) — lazy-loaded from
+# /photos/__faces/brain/<uuid>.json. Rebuilt by scripts/build_brain.py.
+_brain_centroids = None         # numpy [n_buckets, 512] L2-normalized
+_brain_bucket_person_ix = None  # numpy int [n_buckets] → index into _brain_persons_order
+_brain_persons_order: list[str] | None = None  # person_id at each persons-index
+_brain_persons: dict[str, dict] | None = None  # person_id → {name, dob_year, n_total, negatives}
+_brain_bucket_meta: list[dict] | None = None   # {key, n, radius} per bucket
+_brain_seg_starts = None         # numpy int — np.maximum.reduceat segment starts
+_brain_seg_persons = None        # numpy int — person ix at each segment start
+_brain_sort_idx = None           # numpy int — sort buckets by person ix
+_brain_loaded_at: float = 0.0
+_brain_lock = threading.Lock()
+
+
+def _load_brain():
+    """Lazy-load all per-person brain files into a single numpy structure for
+    fast cluster-vs-brain scoring. Reloads if any brain file is newer than
+    last load. Returns None tuple if no brain files exist yet."""
+    import numpy as np
+    global _brain_centroids, _brain_bucket_person_ix, _brain_persons_order, _brain_persons
+    global _brain_bucket_meta, _brain_seg_starts, _brain_seg_persons, _brain_sort_idx, _brain_loaded_at
+    with _brain_lock:
+        if not BRAIN_DIR.exists():
+            return None
+        files = list(BRAIN_DIR.glob("*.json"))
+        if not files:
+            return None
+        if _brain_centroids is not None:
+            try:
+                newest = max(f.stat().st_mtime for f in files)
+                if newest <= _brain_loaded_at:
+                    return (_brain_centroids, _brain_bucket_person_ix, _brain_persons_order,
+                            _brain_persons, _brain_bucket_meta, _brain_seg_starts,
+                            _brain_seg_persons, _brain_sort_idx)
+            except (FileNotFoundError, ValueError):
+                pass
+        centroids: list[list[float]] = []
+        bucket_person_ix: list[int] = []
+        bucket_meta: list[dict] = []
+        persons_order: list[str] = []
+        persons: dict[str, dict] = {}
+        for f in files:
+            try:
+                d = json.loads(f.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            pid = d.get("person_id")
+            if not pid or not d.get("buckets"):
+                continue
+            person_ix = len(persons_order)
+            persons_order.append(pid)
+            persons[pid] = {
+                "name":       d.get("person_name"),
+                "dob_year":   d.get("dob_year"),
+                "n_total":    d.get("n_confirmed_total", 0),
+                "negatives":  {(x[0], int(x[1])) for x in d.get("negative_examples", []) if x},
+            }
+            for b in d["buckets"]:
+                centroids.append(b["centroid"])
+                bucket_person_ix.append(person_ix)
+                bucket_meta.append({"key": b["key"], "n": b["n"], "radius": b["radius"]})
+        if not centroids:
+            return None
+        _brain_centroids = np.asarray(centroids, dtype=np.float32)
+        _brain_bucket_person_ix = np.asarray(bucket_person_ix, dtype=np.int32)
+        _brain_persons_order = persons_order
+        _brain_persons = persons
+        _brain_bucket_meta = bucket_meta
+        # Pre-compute reduceat segment info for fast per-person max
+        _brain_sort_idx = np.argsort(_brain_bucket_person_ix, kind="stable")
+        sorted_persons = _brain_bucket_person_ix[_brain_sort_idx]
+        _brain_seg_starts = np.concatenate(([0], np.where(np.diff(sorted_persons) != 0)[0] + 1)).astype(np.int64)
+        _brain_seg_persons = sorted_persons[_brain_seg_starts]
+        import time
+        _brain_loaded_at = time.time()
+        log.info(
+            f"brain loaded: {len(persons_order)} people, {len(centroids)} buckets"
+        )
+        return (_brain_centroids, _brain_bucket_person_ix, _brain_persons_order,
+                _brain_persons, _brain_bucket_meta, _brain_seg_starts,
+                _brain_seg_persons, _brain_sort_idx)
+
+
+def _invalidate_brain():
+    """Force next _load_brain() to re-read all files."""
+    global _brain_centroids
+    with _brain_lock:
+        _brain_centroids = None
 
 
 def _load_embedding_index():
@@ -701,6 +791,16 @@ async def bulk_assign_faces(body: dict, request: Request):
     global _neo4j_assigned
     _neo4j_assigned = None
 
+    # Rebuild this person's brain so the suggestion engine sees the new faces.
+    if assigned_count:
+        try:
+            from app.services.brain import rebuild_person_brain
+            async with get_session() as session:
+                await rebuild_person_brain(person_id, session)
+            _invalidate_brain()
+        except Exception as e:
+            log.warning(f"brain rebuild failed for {person_id}: {e}")
+
     return {"assigned": assigned_count, "missing": missing, "requested": len(faces)}
 
 
@@ -720,6 +820,14 @@ async def unassign_face(request: Request, person_id: str, photo_path: str, face_
         )
         if not await res.single():
             raise HTTPException(404, "Assignment not found")
+
+        # Rebuild brain in the same session.
+        try:
+            from app.services.brain import rebuild_person_brain
+            await rebuild_person_brain(person_id, session)
+            _invalidate_brain()
+        except Exception as e:
+            log.warning(f"brain rebuild failed for {person_id}: {e}")
 
     global _neo4j_assigned
     _neo4j_assigned = None
@@ -880,6 +988,508 @@ async def list_clusters(status: str = "unassigned", limit: int = 50, offset: int
                 r["person_avatar"] = p.get("avatar")
 
     return {"clusters": result, "total": total, "offset": offset}
+
+
+class GroupedSuggestionsBody(BaseModel):
+    threshold: float = 0.75
+    margin: float = 0.05            # gap between #1 and #2 to count as "group" vs "cascade"
+    limit: int = 50                 # max groups (or ambiguous clusters) to return per list
+    person_ids: list[str] | None = None  # if set, only score against these brain people
+    min_cluster_size: int = 3       # skip remaining clusters smaller than this
+    inter_threshold: float = 0.80   # pairwise sim to call 2 unmatched clusters the same unknown
+    min_unknown_clusters: int = 2   # min clusters in an unknown-person candidate group
+    min_unknown_faces: int = 6      # min total faces in an unknown-person candidate group
+    maybe_threshold: float = 0.65   # combined-centroid sim floor for "Maybe X?" hints on unknown candidates
+
+
+@router.post("/unassigned/grouped")
+async def grouped_suggestions(body: GroupedSuggestionsBody):
+    """For every remaining-unassigned cluster, score its centroid against every
+    person's brain (best-bucket per person), then group clusters by inferred
+    identity. Returns:
+      - `groups`: high-confidence groupings ("Likely Stephen — 8 clusters, 240 faces")
+      - `ambiguous`: clusters whose top-2 candidates are within `margin` (cascade fodder)
+      - `unmatched_count`: clusters with no candidate above `threshold`
+
+    No writes. UI calls this to render the "Likely matches" section.
+    """
+    import asyncio, numpy as np
+
+    matrix, meta, lookup = await asyncio.to_thread(_load_embedding_index)
+    if matrix is None:
+        raise HTTPException(503, "Embedding index not built yet")
+
+    brain = await asyncio.to_thread(_load_brain)
+    if brain is None:
+        raise HTTPException(503, "Brain not built — run scripts/build_brain.py")
+    (centroids, bucket_person_ix, persons_order, persons, bucket_meta,
+     seg_starts, seg_persons, sort_idx) = brain
+
+    # Optional person-subset filter — rebuild seg structures over the filtered slice
+    if body.person_ids:
+        wanted = set(body.person_ids)
+        keep_person_ix = {pi for pi, pid in enumerate(persons_order) if pid in wanted}
+        if not keep_person_ix:
+            return {"groups": [], "ambiguous": [], "unmatched_count": 0}
+        mask = np.isin(bucket_person_ix, np.array(sorted(keep_person_ix), dtype=np.int32))
+        centroids = centroids[mask]
+        sub_person_ix = bucket_person_ix[mask]
+        sort_idx = np.argsort(sub_person_ix, kind="stable")
+        sorted_p = sub_person_ix[sort_idx]
+        seg_starts = np.concatenate(([0], np.where(np.diff(sorted_p) != 0)[0] + 1)).astype(np.int64)
+        seg_persons = sorted_p[seg_starts]
+
+    clusters_data = _load(CLUSTERS_FILE, {})
+    skipped = set(str(s) for s in _load(SKIPPED_FILE, []))
+    done = await _get_neo4j_assigned()
+    done = set(done) | await _get_neo4j_skipped()
+
+    # Walk every unskipped cluster, drop already-handled faces, keep remaining + their embedding rows
+    cluster_summary: list[dict] = []
+    for cid, faces in clusters_data.items():
+        if cid == "-1" or cid in skipped:
+            continue
+        remaining = []
+        emb_indices: list[int] = []
+        for f in faces:
+            pp = f.get("photo_path", "")
+            pp = pp.replace("/photos/", "", 1) if pp.startswith("/photos/") else pp
+            fi = f.get("face_index")
+            if pp and fi is not None and (pp, int(fi)) not in done:
+                remaining.append(f)
+                idx = lookup.get((pp, int(fi)))
+                if idx is not None:
+                    emb_indices.append(idx)
+        if len(remaining) < body.min_cluster_size or not emb_indices:
+            continue
+        cluster_summary.append({
+            "cluster_id": str(cid),
+            "remaining": remaining,
+            "emb_indices": emb_indices,
+        })
+
+    if not cluster_summary:
+        return {"groups": [], "ambiguous": [], "unmatched_count": 0}
+
+    # Build per-cluster centroids
+    n_clusters = len(cluster_summary)
+    cluster_centroids = np.zeros((n_clusters, matrix.shape[1]), dtype=np.float32)
+    for i, cs in enumerate(cluster_summary):
+        c = matrix[cs["emb_indices"]].mean(axis=0)
+        norm = np.linalg.norm(c)
+        if norm > 0:
+            c = c / norm
+        cluster_centroids[i] = c
+
+    # [n_clusters, n_buckets] cosine sims, then groupby-person max via reduceat
+    sims = cluster_centroids @ centroids.T
+    sorted_sims = sims[:, sort_idx]
+    per_person_sims = np.maximum.reduceat(sorted_sims, seg_starts, axis=1)
+    # per_person_sims[ci, k] = best sim of cluster ci to person at seg_persons[k]
+
+    # Per cluster: top-K candidates (sorted by sim desc) → decide group/cascade/unmatched
+    groups_by_person: dict[str, list[dict]] = {}
+    ambiguous: list[dict] = []
+    unmatched_indices: list[int] = []   # cluster_summary indices for unknown-person grouping
+
+    # Pre-sort each row's person scores descending. Top-N per cluster is cheap.
+    TOP_K = 3
+    for ci, cs in enumerate(cluster_summary):
+        row = per_person_sims[ci]
+        # Sort high-to-low
+        order = np.argsort(-row)[:TOP_K]
+        top_pid = persons_order[seg_persons[order[0]]]
+        top_sim = float(row[order[0]])
+
+        if top_sim < body.threshold:
+            unmatched_indices.append(ci)
+            continue
+
+        samples = [
+            {
+                "crop_url":   _crop_url(f["crop_path"]),
+                "photo_path": (f.get("photo_path", "") or "").replace("/photos/", "", 1)
+                              if (f.get("photo_path", "") or "").startswith("/photos/")
+                              else (f.get("photo_path", "") or ""),
+            }
+            for f in cs["remaining"][:SAMPLE_CROPS] if f.get("crop_path")
+        ]
+        cluster_entry = {
+            "cluster_id":  cs["cluster_id"],
+            "n_faces":     len(cs["remaining"]),
+            "similarity":  round(top_sim, 4),
+            "samples":     samples,
+        }
+
+        second_sim = float(row[order[1]]) if len(order) > 1 else 0.0
+        gap = top_sim - second_sim
+
+        if gap >= body.margin:
+            groups_by_person.setdefault(top_pid, []).append(cluster_entry)
+        else:
+            candidates = []
+            for oi in order:
+                sim = float(row[oi])
+                if sim < body.threshold:
+                    break
+                pid = persons_order[seg_persons[oi]]
+                p = persons.get(pid, {})
+                candidates.append({
+                    "person_id":   pid,
+                    "person_name": p.get("name"),
+                    "n_total":     p.get("n_total", 0),
+                    "similarity":  round(sim, 4),
+                })
+            cluster_entry["candidates"] = candidates
+            ambiguous.append(cluster_entry)
+
+    groups = []
+    for pid, cl_list in groups_by_person.items():
+        p = persons.get(pid, {})
+        n_faces = sum(c["n_faces"] for c in cl_list)
+        avg_sim = sum(c["similarity"] for c in cl_list) / len(cl_list)
+        groups.append({
+            "person_id":      pid,
+            "person_name":    p.get("name"),
+            "person_n_total": p.get("n_total", 0),
+            "n_clusters":     len(cl_list),
+            "n_faces":        n_faces,
+            "avg_similarity": round(avg_sim, 4),
+            "clusters":       sorted(cl_list, key=lambda c: -c["n_faces"]),
+        })
+    groups.sort(key=lambda g: -g["n_faces"])
+
+    # Enrich groups with avatar from Neo4j (one query)
+    if groups:
+        try:
+            async with get_session() as session:
+                res = await session.run(
+                    "MATCH (p:Person) WHERE p.id IN $ids RETURN p.id AS id, p.avatar AS avatar, p.known_as AS known_as",
+                    ids=[g["person_id"] for g in groups],
+                )
+                meta_rows = {row["id"]: row for row in await res.data()}
+            for g in groups:
+                m = meta_rows.get(g["person_id"])
+                if m:
+                    g["person_avatar"]   = m.get("avatar")
+                    g["person_known_as"] = m.get("known_as") if m.get("known_as") != g["person_name"] else None
+        except Exception as e:
+            log.warning(f"grouped_suggestions avatar lookup failed: {e}")
+
+    # Unknown-person candidates: pairwise sim on UNMATCHED cluster centroids → transitive closure
+    unknown_candidates: list[dict] = []
+    grouped_unmatched = set()  # cluster_summary indices absorbed into an unknown candidate
+    n_unmatched = len(unmatched_indices)
+    if n_unmatched >= body.min_unknown_clusters:
+        sub = cluster_centroids[np.asarray(unmatched_indices)]
+        pair_sims = sub @ sub.T                          # symmetric, diag=1
+        # Union-find over pairs above threshold (i < j to avoid double-edges + diagonal)
+        parent = list(range(n_unmatched))
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+        iu, ju = np.where(np.triu(pair_sims >= body.inter_threshold, k=1))
+        for a, b in zip(iu, ju):
+            union(int(a), int(b))
+        # Bucket by root
+        groups_local: dict[int, list[int]] = {}
+        for i in range(n_unmatched):
+            groups_local.setdefault(find(i), []).append(i)
+        for members in groups_local.values():
+            if len(members) < body.min_unknown_clusters:
+                continue
+            # Map back to cluster_summary indices
+            cs_indices = [unmatched_indices[m] for m in members]
+            cluster_entries = []
+            total_faces = 0
+            for cs_ix in cs_indices:
+                cs = cluster_summary[cs_ix]
+                cluster_entries.append({
+                    "cluster_id": cs["cluster_id"],
+                    "n_faces":    len(cs["remaining"]),
+                    "samples":    [
+                        {
+                            "crop_url":   _crop_url(f["crop_path"]),
+                            "photo_path": (f.get("photo_path", "") or "").replace("/photos/", "", 1)
+                                          if (f.get("photo_path", "") or "").startswith("/photos/")
+                                          else (f.get("photo_path", "") or ""),
+                        }
+                        for f in cs["remaining"][:SAMPLE_CROPS] if f.get("crop_path")
+                    ],
+                })
+                total_faces += len(cs["remaining"])
+            if total_faces < body.min_unknown_faces:
+                continue
+            # Avg pairwise sim within the group (upper triangle only)
+            m_idx = np.asarray(members)
+            sub_pairs = pair_sims[np.ix_(m_idx, m_idx)]
+            triu = sub_pairs[np.triu_indices_from(sub_pairs, k=1)]
+            avg_inter = float(triu.mean()) if triu.size else 1.0
+
+            # "Maybe X?" hints — score the COMBINED candidate centroid against brain.
+            # Take mean of member-cluster per_person_sims as approximation. Surface
+            # top-3 known people whose mean-sim across all member clusters >= maybe_threshold.
+            maybe_candidates = []
+            cs_ix_arr = np.asarray(cs_indices)
+            mean_per_person = per_person_sims[cs_ix_arr].mean(axis=0)
+            maybe_order = np.argsort(-mean_per_person)[:3]
+            for oi in maybe_order:
+                msim = float(mean_per_person[oi])
+                if msim < body.maybe_threshold:
+                    break
+                pid = persons_order[seg_persons[oi]]
+                p = persons.get(pid, {})
+                maybe_candidates.append({
+                    "person_id":   pid,
+                    "person_name": p.get("name"),
+                    "n_total":     p.get("n_total", 0),
+                    "similarity":  round(msim, 4),
+                })
+
+            unknown_candidates.append({
+                # Deterministic id from sorted cluster_ids so the same candidate is stable across requests
+                "candidate_id":      "uc:" + ",".join(sorted(c["cluster_id"] for c in cluster_entries)),
+                "n_clusters":        len(cluster_entries),
+                "n_faces":           total_faces,
+                "avg_inter_similarity": round(avg_inter, 4),
+                "clusters":          sorted(cluster_entries, key=lambda c: -c["n_faces"]),
+                "maybe_candidates":  maybe_candidates,
+            })
+            for cs_ix in cs_indices:
+                grouped_unmatched.add(cs_ix)
+        # Sort: candidates with "Maybe X?" hints first (more actionable), then by face count desc
+        unknown_candidates.sort(key=lambda c: (0 if c.get("maybe_candidates") else 1, -c["n_faces"]))
+
+    unmatched_count = n_unmatched - len(grouped_unmatched)
+
+    return {
+        "groups":             groups[:body.limit],
+        "ambiguous":          ambiguous[:body.limit],
+        "unknown_candidates": unknown_candidates[:body.limit],
+        "unmatched_count":    unmatched_count,
+    }
+
+
+class LeftoverBody(BaseModel):
+    threshold: float = 0.75
+    inter_threshold: float = 0.80
+    min_unknown_clusters: int = 2
+    min_unknown_faces: int = 6
+    min_cluster_size: int = 3
+    maybe_threshold: float = 0.55     # surface best-guess person even below main threshold
+    offset: int = 0
+    limit: int = 50
+
+
+@router.post("/unassigned/leftover")
+async def leftover_unassigned(body: LeftoverBody):
+    """Paginated brain-unmatched clusters — the long tail that didn't make it into
+    `groups`, `ambiguous`, or `unknown_candidates` on `/unassigned/grouped`. UI
+    renders these so every cluster is reachable from `/suggestions` (no need to
+    bounce out to `/unassigned`)."""
+    import asyncio, numpy as np
+
+    matrix, meta, lookup = await asyncio.to_thread(_load_embedding_index)
+    if matrix is None:
+        raise HTTPException(503, "Embedding index not built yet")
+    brain = await asyncio.to_thread(_load_brain)
+    if brain is None:
+        raise HTTPException(503, "Brain not built — run scripts/build_brain.py")
+    (centroids, bucket_person_ix, persons_order, persons, bucket_meta,
+     seg_starts, seg_persons, sort_idx) = brain
+
+    clusters_data = _load(CLUSTERS_FILE, {})
+    skipped = set(str(s) for s in _load(SKIPPED_FILE, []))
+    done = await _get_neo4j_assigned()
+    done = set(done) | await _get_neo4j_skipped()
+
+    cluster_summary: list[dict] = []
+    for cid, faces in clusters_data.items():
+        if cid == "-1" or cid in skipped:
+            continue
+        remaining = []
+        emb_indices: list[int] = []
+        for f in faces:
+            pp = f.get("photo_path", "")
+            pp = pp.replace("/photos/", "", 1) if pp.startswith("/photos/") else pp
+            fi = f.get("face_index")
+            if pp and fi is not None and (pp, int(fi)) not in done:
+                remaining.append(f)
+                idx = lookup.get((pp, int(fi)))
+                if idx is not None:
+                    emb_indices.append(idx)
+        if len(remaining) < body.min_cluster_size or not emb_indices:
+            continue
+        cluster_summary.append({
+            "cluster_id":  str(cid),
+            "remaining":   remaining,
+            "emb_indices": emb_indices,
+        })
+    if not cluster_summary:
+        return {"leftover": [], "total": 0, "offset": body.offset, "limit": body.limit}
+
+    n_clusters = len(cluster_summary)
+    cluster_centroids = np.zeros((n_clusters, matrix.shape[1]), dtype=np.float32)
+    for i, cs in enumerate(cluster_summary):
+        c = matrix[cs["emb_indices"]].mean(axis=0)
+        norm = np.linalg.norm(c)
+        if norm > 0:
+            c = c / norm
+        cluster_centroids[i] = c
+
+    sims = cluster_centroids @ centroids.T
+    sorted_sims = sims[:, sort_idx]
+    per_person_sims = np.maximum.reduceat(sorted_sims, seg_starts, axis=1)
+
+    unmatched_indices = [ci for ci in range(n_clusters)
+                         if float(per_person_sims[ci].max()) < body.threshold]
+
+    # Strip clusters that would join an unknown-person candidate (those are surfaced separately)
+    grouped_unmatched = set()
+    n_unmatched = len(unmatched_indices)
+    if n_unmatched >= body.min_unknown_clusters:
+        sub = cluster_centroids[np.asarray(unmatched_indices)]
+        pair_sims = sub @ sub.T
+        parent = list(range(n_unmatched))
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+        iu, ju = np.where(np.triu(pair_sims >= body.inter_threshold, k=1))
+        for a, b in zip(iu, ju):
+            union(int(a), int(b))
+        groups_local: dict[int, list[int]] = {}
+        for i in range(n_unmatched):
+            groups_local.setdefault(find(i), []).append(i)
+        for members in groups_local.values():
+            if len(members) < body.min_unknown_clusters:
+                continue
+            total = sum(len(cluster_summary[unmatched_indices[m]]["remaining"]) for m in members)
+            if total < body.min_unknown_faces:
+                continue
+            for m in members:
+                grouped_unmatched.add(unmatched_indices[m])
+
+    leftover_indices = [ci for ci in unmatched_indices if ci not in grouped_unmatched]
+    # Sort: clusters where brain has any "best guess" (>= maybe_threshold) come first,
+    # then by face count desc. Surfaces the actionable ones at the top of the long tail.
+    leftover_indices.sort(key=lambda ci: (
+        0 if float(per_person_sims[ci].max()) >= body.maybe_threshold else 1,
+        -len(cluster_summary[ci]["remaining"]),
+    ))
+
+    total = len(leftover_indices)
+    page = leftover_indices[body.offset : body.offset + body.limit]
+
+    leftover = []
+    for ci in page:
+        cs = cluster_summary[ci]
+        row = per_person_sims[ci]
+        top_ix = int(np.argmax(row))
+        top_sim = float(row[top_ix])
+        best_candidate = None
+        if top_sim >= body.maybe_threshold:
+            pid = persons_order[seg_persons[top_ix]]
+            p = persons.get(pid, {})
+            best_candidate = {
+                "person_id":   pid,
+                "person_name": p.get("name"),
+                "n_total":     p.get("n_total", 0),
+                "similarity":  round(top_sim, 4),
+            }
+        leftover.append({
+            "cluster_id": cs["cluster_id"],
+            "n_faces":    len(cs["remaining"]),
+            "samples":    [
+                {
+                    "crop_url":   _crop_url(f["crop_path"]),
+                    "photo_path": (f.get("photo_path", "") or "").replace("/photos/", "", 1)
+                                  if (f.get("photo_path", "") or "").startswith("/photos/")
+                                  else (f.get("photo_path", "") or ""),
+                }
+                for f in cs["remaining"][:SAMPLE_CROPS] if f.get("crop_path")
+            ],
+            "best_candidate": best_candidate,
+        })
+
+    # Enrich best_candidate entries with known_as so UI can render "Full Name (Nickname)"
+    bc_ids = {c["best_candidate"]["person_id"] for c in leftover if c.get("best_candidate")}
+    if bc_ids:
+        try:
+            async with get_session() as session:
+                res = await session.run(
+                    "MATCH (p:Person) WHERE p.id IN $ids "
+                    "RETURN p.id AS id, p.known_as AS known_as",
+                    ids=list(bc_ids),
+                )
+                kn_map = {row["id"]: row["known_as"] for row in await res.data()}
+            for c in leftover:
+                bc = c.get("best_candidate")
+                if bc:
+                    known_as = kn_map.get(bc["person_id"])
+                    bc["person_known_as"] = known_as if known_as and known_as != bc.get("person_name") else None
+        except Exception as e:
+            log.warning(f"leftover known_as enrichment failed: {e}")
+
+    return {
+        "leftover": leftover,
+        "total":    total,
+        "offset":   body.offset,
+        "limit":    body.limit,
+    }
+
+
+class RejectBody(BaseModel):
+    person_id: str
+    faces: list[dict]   # each: {photo_path, face_index}
+
+
+@router.post("/reject")
+async def reject_faces(body: RejectBody, request: Request):
+    """Tell the brain that none of these faces are this person. Appends to the
+    person's `negative_examples` list so they never get suggested again.
+
+    Used by cascade mode ("No, that's not Patty") and group-level rejection.
+    Idempotent — re-rejecting an already-negative face is a no-op.
+    """
+    from app.services.brain import append_negatives
+
+    items: list[tuple[str, int]] = []
+    for f in body.faces:
+        pp = f.get("photo_path", "")
+        fi = f.get("face_index")
+        if pp and fi is not None:
+            items.append((pp, int(fi)))
+    if not items:
+        return {"added": 0, "requested": 0}
+
+    added = append_negatives(body.person_id, items)
+    if added:
+        _invalidate_brain()
+
+    person_name = await _get_person_name(body.person_id)
+    log.bind(
+        event="face.rejected",
+        person_id=body.person_id,
+        person_name=person_name,
+        count=added,
+        requested=len(items),
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("faces rejected for person (added to negative_examples)")
+
+    return {"added": added, "requested": len(items)}
 
 
 @router.get("/clusters/{cluster_id}")
@@ -1056,9 +1666,9 @@ async def unskip_cluster(cluster_id: str, request: Request):
 
 
 def _sync_to_neo4j(person_id: str, faces: list):
-    import asyncio
     from neo4j import GraphDatabase
     from app.config import settings as s
+    from app.services.brain import rebuild_person_brain_sync
 
     try:
         driver = GraphDatabase.driver(s.neo4j_uri, auth=(s.neo4j_user, s.neo4j_password))
@@ -1072,6 +1682,32 @@ def _sync_to_neo4j(person_id: str, faces: list):
                     "face_index": f.get("face_index"),
                     "crop_path":  crop_path,
                 })
+            # Pre-check Media existence so we can loudly warn about ghost paths.
+            # Silent MERGE-skips on missing Media nodes is what tricked us into
+            # thinking the brain was broken when really the cluster index was
+            # pointing at deleted files.
+            distinct_paths = list({b["photo_path"] for b in batch if b["photo_path"]})
+            present_paths: set[str] = set()
+            for i in range(0, len(distinct_paths), 1000):
+                res = session.run(
+                    "MATCH (m:Media) WHERE m.path IN $paths RETURN m.path AS p",
+                    paths=distinct_paths[i:i+1000],
+                )
+                for row in res:
+                    present_paths.add(row["p"])
+            ghost_batch = [b for b in batch if b["photo_path"] not in present_paths]
+            if ghost_batch:
+                log.bind(
+                    event="face.assign.ghost_paths",
+                    person_id=person_id,
+                    ghost_count=len(ghost_batch),
+                    total_requested=len(batch),
+                    sample=[b["photo_path"] for b in ghost_batch[:5]],
+                ).warning(
+                    f"{len(ghost_batch)} of {len(batch)} cluster faces point at Media nodes "
+                    f"that don't exist in Neo4j — skipping. Run "
+                    f"scripts/purge_ghost_cluster_faces.py to clean the cluster index."
+                )
             for i in range(0, len(batch), 200):
                 session.run(
                     """
@@ -1085,6 +1721,16 @@ def _sync_to_neo4j(person_id: str, faces: list):
                     person_id=person_id,
                     batch=batch[i:i+200],
                 )
+            # Rebuild brain in the same session so the file reflects the new edges.
+            try:
+                brain = rebuild_person_brain_sync(person_id, session)
+                _invalidate_brain()
+                log.info(
+                    f"brain rebuilt for {person_id}: "
+                    f"n_total={brain['n_confirmed_total'] if brain else 'below-floor'}"
+                )
+            except Exception as e:
+                log.warning(f"brain rebuild failed for {person_id}: {e}")
         driver.close()
         log.info(f"Synced {len(faces)} faces for person {person_id}")
     except Exception as e:

@@ -441,6 +441,14 @@ async def assign_face(person_id: str, body: FaceAssign, request: Request):
             **_ctx(request),
         ).info("face assigned")
 
+        try:
+            from app.services.brain import rebuild_person_brain
+            from app.routers.faces import _invalidate_brain
+            await rebuild_person_brain(person_id, session)
+            _invalidate_brain()
+        except Exception as e:
+            logger.warning(f"brain rebuild failed for {person_id}: {e}")
+
 
 @router.get("/{person_id}/faces")
 async def get_faces(person_id: str):

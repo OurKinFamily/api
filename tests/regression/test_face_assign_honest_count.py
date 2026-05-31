@@ -14,18 +14,34 @@ from app.main import app
 
 
 def _session_factory(per_call_singles):
-    """`per_call_singles` is an iterable; each `session.run(...)` returns
-    a result whose `.single()` yields the next value. Lets us simulate
-    \"first face matched, second didn't\" with realistic Neo4j semantics."""
+    """Each call to `session.run(<MATCH … MERGE … RETURN photo.path>)` returns
+    a result whose `.single()` yields the next entry from `per_call_singles`.
+    Other `session.run` calls (e.g. the `_get_person_name` lookup or the
+    brain-rebuild query) get an inert AsyncMock that won't blow up — we only
+    care about the per-face MERGE results here. Extra calls beyond the
+    provided list resolve to `single()=None`, not StopIteration."""
     it = iter(per_call_singles)
+    # Track which query produced which mock so test stays robust to extra
+    # session.run calls from sibling code paths (name lookup, brain rebuild).
 
     @asynccontextmanager
     async def _session():
         session = AsyncMock()
 
-        def _run(*_args, **_kwargs):
+        def _run(*args, **kwargs):
             result = AsyncMock()
-            result.single.return_value = next(it)
+            cypher = args[0] if args else ""
+            # Only the per-face MERGE query in bulk_assign_faces consumes our
+            # singles list — it RETURNs `photo.path AS p`. Anything else
+            # (person-name lookup, brain rebuild) gets harmless defaults.
+            if "MERGE" in cypher and "APPEARS_IN" in cypher and "RETURN photo.path" in cypher:
+                try:
+                    result.single.return_value = next(it)
+                except StopIteration:
+                    result.single.return_value = None
+            else:
+                result.single.return_value = None
+                result.data.return_value = []
             return result
 
         session.run.side_effect = _run
@@ -34,8 +50,19 @@ def _session_factory(per_call_singles):
     return _session
 
 
+@pytest.fixture
+def patched_face_assign(monkeypatch):
+    """Common bulk_assign_faces test patches: bypass the post-assign brain
+    rebuild + cache invalidation so the test focuses on the assign loop's
+    honest-count behavior."""
+    async def _noop_rebuild(*_a, **_kw):
+        return None
+    monkeypatch.setattr("app.services.brain.rebuild_person_brain", _noop_rebuild)
+    monkeypatch.setattr("app.routers.faces._invalidate_brain", lambda: None)
+
+
 @pytest.mark.asyncio
-async def test_assigned_count_reflects_actual_merges_not_input_length(monkeypatch):
+async def test_assigned_count_reflects_actual_merges_not_input_length(monkeypatch, patched_face_assign):
     # First face's MATCH resolves → MERGE creates edge → row returned.
     # Second face's MATCH fails (stale path) → row is None.
     singles = [{"p": "archive/0000/x.jpg"}, None]
@@ -61,7 +88,7 @@ async def test_assigned_count_reflects_actual_merges_not_input_length(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_all_misses_yields_zero_assigned(monkeypatch):
+async def test_all_misses_yields_zero_assigned(monkeypatch, patched_face_assign):
     # Both faces fail to MATCH (the case that caused the production loop).
     monkeypatch.setattr(
         "app.routers.faces.get_session",
