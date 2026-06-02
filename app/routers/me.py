@@ -41,10 +41,17 @@ async def _require_user_id(request: Request) -> str:
 
 
 @router.get("/favorites/paths")
-async def favorites_paths(request: Request) -> list[str]:
+async def favorites_paths(request: Request, viewer_id: str | None = None) -> list[str]:
     """Lightweight: just the set of favorited Media paths. Used to hydrate UI
-    on initial load so the heart icons render in their correct state."""
-    user_id = await _require_user_id(request)
+    on initial load so the heart icons render in their correct state.
+
+    viewer_id: admin-only override for preview-as-person mode.
+    """
+    from app.deps import is_admin_email
+    if viewer_id and is_admin_email(_current_email(request)):
+        user_id = viewer_id
+    else:
+        user_id = await _require_user_id(request)
     async with get_session() as session:
         r = await session.run(
             """
@@ -58,9 +65,13 @@ async def favorites_paths(request: Request) -> list[str]:
 
 
 @router.get("/favorites")
-async def favorites(request: Request, limit: int = 100, offset: int = 0):
+async def favorites(request: Request, limit: int = 100, offset: int = 0, viewer_id: str | None = None):
     """Full list of favorited media, most-recently-favorited first."""
-    user_id = await _require_user_id(request)
+    from app.deps import is_admin_email
+    if viewer_id and is_admin_email(_current_email(request)):
+        user_id = viewer_id
+    else:
+        user_id = await _require_user_id(request)
     async with get_session() as session:
         tot_res = await session.run(
             "MATCH (p:Person {id: $uid})-[:FAVORITED]->(:Media) RETURN count(*) AS n",

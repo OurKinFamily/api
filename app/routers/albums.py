@@ -66,11 +66,18 @@ class AlbumAddMedia(BaseModel):
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 @router.get("/")
-async def list_albums(request: Request):
+async def list_albums(request: Request, viewer_id: str | None = None):
     """All albums visible to the current user: public + own private.
     `cover_path` falls back to the most-recently-added media when the album
-    has no explicit cover set."""
-    uid = await _current_user_id(request)
+    has no explicit cover set.
+
+    viewer_id: admin-only override for preview-as-person mode.
+    """
+    from app.deps import is_admin_email
+    if viewer_id and is_admin_email(_current_email(request)):
+        uid = viewer_id
+    else:
+        uid = await _current_user_id(request)
     async with get_session() as session:
         result = await session.run(
             """
@@ -131,8 +138,12 @@ async def create_album(body: AlbumCreate, request: Request):
 
 
 @router.get("/{album_id}")
-async def get_album(album_id: str, request: Request, limit: int = 500, offset: int = 0):
-    uid = await _current_user_id(request)
+async def get_album(album_id: str, request: Request, limit: int = 500, offset: int = 0, viewer_id: str | None = None):
+    from app.deps import is_admin_email
+    if viewer_id and is_admin_email(_current_email(request)):
+        uid = viewer_id
+    else:
+        uid = await _current_user_id(request)
     async with get_session() as session:
         # Album metadata + visibility check (+ implicit cover from latest media)
         meta_res = await session.run(

@@ -567,7 +567,7 @@ _LIFE_BUCKETS = [
 
 
 @router.get("/{person_id}/relationship")
-async def relationship_to_viewer(person_id: str, request: Request):
+async def relationship_to_viewer(person_id: str, request: Request, viewer_id: str | None = None):
     """Viewer→subject English relationship line for the Person header.
 
     Walks PARENT_OF up from both viewer and subject, finds the lowest common
@@ -575,20 +575,27 @@ async def relationship_to_viewer(person_id: str, request: Request):
     great-grand-uncle / etc), and tags maternal/paternal side using the
     viewer's parent gender. Spouse + in-law shortcuts handled before the
     blood-line walk.
+
+    viewer_id: optional override for admin preview-as-person mode.
     """
-    # Lazy import to avoid circular deps with me.py
     from app.routers.me import _current_email
-    email = _current_email(request)
-    if not email:
-        return {"label": None, "side": None}
+    from app.deps import is_admin_email
 
     async with get_session() as session:
-        # Resolve viewer
-        rv = await session.run("MATCH (v:Person {email: $e}) RETURN v.id AS id", e=email)
-        vrow = await rv.single()
-        if not vrow:
-            return {"label": None, "side": None}
-        viewer_id = vrow["id"]
+        # Resolve viewer — use viewer_id override if caller is admin
+        if viewer_id and is_admin_email(_current_email(request)):
+            resolved_viewer_id = viewer_id
+        else:
+            email = _current_email(request)
+            if not email:
+                return {"label": None, "side": None}
+            rv = await session.run("MATCH (v:Person {email: $e}) RETURN v.id AS id", e=email)
+            vrow = await rv.single()
+            if not vrow:
+                return {"label": None, "side": None}
+            resolved_viewer_id = vrow["id"]
+
+        viewer_id = resolved_viewer_id
         if viewer_id == person_id:
             return {"label": "yourself", "side": None}
 
@@ -645,9 +652,10 @@ async def relationship_to_viewer(person_id: str, request: Request):
             m = s_anc[best]
             label = _format_relationship(n, m, subj_gender)
             side = None
-            # Siblings share both parents → showing a "side" is arbitrary.
-            # Same for descendants of the viewer (your kids aren't on a "side").
-            if parent_via and n >= 1 and not (n == 1 and m == 1):
+            # Side only meaningful for lateral relationships (cousins, uncles, etc.)
+            # Not for direct lines: n=0 (your child) or m=0 (your parent/grandparent).
+            # Siblings (n==1, m==1) share both parents so side is arbitrary too.
+            if parent_via and n >= 1 and m >= 1 and not (n == 1 and m == 1):
                 rp = await session.run(
                     "MATCH (p:Person {id: $pid}) RETURN p.gender AS g",
                     pid=parent_via,

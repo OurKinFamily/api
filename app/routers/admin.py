@@ -1734,7 +1734,9 @@ async def me(request: Request):
             email=email,
         )
         row = await result.single()
+    from app.deps import is_admin_email
     return {
-        "email":  email,
-        "person": dict(row) if row else None,
+        "email":    email,
+        "is_admin": is_admin_email(email),
+        "person":   dict(row) if row else None,
     }

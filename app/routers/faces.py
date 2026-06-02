@@ -8,14 +8,15 @@ import threading
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.config import settings, with_v
 from app.db.neo4j import get_session
+from app.deps import require_admin
 from app.log import logger as log
 
-router = APIRouter(prefix="/faces", tags=["faces"])
+router = APIRouter(prefix="/faces", tags=["faces"], dependencies=[Depends(require_admin)])
 
 CLUSTERS_DIR            = settings.photos_root / "__faces" / "clusters"
 CLUSTERS_FILE           = CLUSTERS_DIR / "clusters.json"

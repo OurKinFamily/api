@@ -14,12 +14,13 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
+from app.deps import require_admin
 from app.log import logger as log
 
-router = APIRouter(prefix="/jobs", tags=["jobs"])
+router = APIRouter(prefix="/jobs", tags=["jobs"], dependencies=[Depends(require_admin)])
 
 JOBS_CONFIG   = Path(__file__).parent.parent.parent / "jobs.json"
 JOBS_DATA_DIR = Path(os.environ.get("JOBS_DATA_DIR", "/photos/__data/workers"))
