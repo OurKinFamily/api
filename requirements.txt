@@ -7,3 +7,4 @@ scipy
 Pillow
 python-multipart
 loguru
+httpx
