@@ -45,7 +45,15 @@ async def search_people(q: str, limit: int = 20):
 @router.get("/", response_model=list[Person])
 async def list_people():
     async with get_session() as session:
-        result = await session.run("MATCH (p:Person) RETURN p ORDER BY p.name")
+        result = await session.run(
+            """
+            MATCH (p:Person)
+            OPTIONAL MATCH (p)-[:APPEARS_IN]->(m:Media)
+            WITH p, count(m) AS photo_count
+            RETURN p
+            ORDER BY photo_count DESC, p.name
+            """
+        )
         records = await result.data()
         return [Person(**r["p"]) for r in records]
 
