@@ -1003,6 +1003,32 @@ class GroupedSuggestionsBody(BaseModel):
     maybe_threshold: float = 0.65   # combined-centroid sim floor for "Maybe X?" hints on unknown candidates
 
 
+@router.get("/unassigned/count")
+async def unassigned_count():
+    """Lightweight tally for the Face Suggestions header: how many detected faces
+    are still unassigned (and not skipped). Excludes noise (-1), skipped clusters,
+    and every face already assigned via APPEARS_IN or face-level skipped. Counts
+    only faces present in the embedding index (the ones actually actionable)."""
+    import asyncio
+    _matrix, _meta, lookup = await asyncio.to_thread(_load_embedding_index)
+    clusters = _load(CLUSTERS_FILE, {})
+    skipped = set(str(s) for s in _load(SKIPPED_FILE, []))
+    done = set(await _get_neo4j_assigned()) | set(await _get_neo4j_skipped())
+
+    remaining = 0
+    for cid, faces in clusters.items():
+        if cid == "-1" or cid in skipped:
+            continue
+        for f in faces:
+            pp = f.get("photo_path", "")
+            pp = pp.replace("/photos/", "", 1) if pp.startswith("/photos/") else pp
+            fi = f.get("face_index")
+            if pp and fi is not None and (pp, int(fi)) not in done:
+                if lookup is None or (pp, int(fi)) in lookup:
+                    remaining += 1
+    return {"remaining": remaining, "assigned": len(await _get_neo4j_assigned())}
+
+
 @router.post("/unassigned/grouped")
 async def grouped_suggestions(body: GroupedSuggestionsBody):
     """For every remaining-unassigned cluster, score its centroid against every
@@ -1082,8 +1108,25 @@ async def grouped_suggestions(body: GroupedSuggestionsBody):
             c = c / norm
         cluster_centroids[i] = c
 
-    # [n_clusters, n_buckets] cosine sims, then groupby-person max via reduceat
-    sims = cluster_centroids @ centroids.T
+    # [n_clusters, n_buckets] cosine sims. Score each cluster by the MAX over its
+    # individual faces (not the cluster mean): one clean face that strongly matches
+    # a centroid is strong evidence, whereas averaging the cluster's faces dilutes
+    # that signal when the cluster also holds blurry / off-angle crops. The mean
+    # `cluster_centroids` (built above) is still used downstream for unknown-person
+    # pairwise grouping.
+    #
+    # Vectorised: stack every cluster's faces into one matrix, do a single matmul
+    # against all centroids, then segment-max per cluster via reduceat. Avoids a
+    # Python loop of ~thousands of small matmuls (which was ~20s at 150 centroids).
+    all_face_idx = []
+    face_seg_starts = []          # row in the stacked matrix where each cluster begins
+    cursor = 0
+    for cs in cluster_summary:
+        face_seg_starts.append(cursor)
+        all_face_idx.extend(cs["emb_indices"])
+        cursor += len(cs["emb_indices"])
+    face_sims_all = matrix[all_face_idx] @ centroids.T         # [total_faces, n_buckets]
+    sims = np.maximum.reduceat(face_sims_all, face_seg_starts, axis=0)  # [n_clusters, n_buckets]
     sorted_sims = sims[:, sort_idx]
     per_person_sims = np.maximum.reduceat(sorted_sims, seg_starts, axis=1)
     # per_person_sims[ci, k] = best sim of cluster ci to person at seg_persons[k]

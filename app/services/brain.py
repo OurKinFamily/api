@@ -20,7 +20,33 @@ from app.config import settings
 
 COLD_START_MIN = 1
 BUCKET_YEARS = 5
+APPEARANCE_K_MAX = 150        # ceiling on appearance centroids per person
+APPEARANCE_PER_CENTROID = 50  # ~one centroid per this many clean faces
+APPEARANCE_MIN_FACES = 6      # skip appearance pass if fewer clean faces
+OUTLIER_SIGMA = 2.0           # drop confirmed faces > N sigma from global mean
 BRAIN_DIR = settings.photos_root / "__faces" / "brain"
+
+
+def kmeans_centroids(X: np.ndarray, K: int, n_iter: int = 25) -> np.ndarray:
+    """Lloyd K-means on L2-normalised embeddings. Returns K normalised centroids."""
+    rng = np.random.default_rng(42)
+    idx = rng.choice(len(X), K, replace=False)
+    centroids = X[idx].copy()
+    for _ in range(n_iter):
+        labels = (X @ centroids.T).argmax(axis=1)
+        new = np.zeros_like(centroids)
+        for k in range(K):
+            m = labels == k
+            if m.any():
+                c = X[m].mean(axis=0)
+                n = np.linalg.norm(c)
+                new[k] = c / n if n > 0 else centroids[k]
+            else:
+                new[k] = centroids[k]
+        if np.allclose(centroids, new, atol=1e-4):
+            break
+        centroids = new
+    return centroids
 
 
 def _strip_root(p: str) -> str:
@@ -107,10 +133,25 @@ def build_brain_dict(
     if n_total < COLD_START_MIN:
         return None
 
+    # Outlier removal: drop faces > OUTLIER_SIGMA std below the global mean
+    # similarity (blurry / side-angle / misidentified crops dilute centroids).
+    all_indices_raw = [i for v in bucket_rows.values() for i in v]
+    if len(all_indices_raw) >= 4:
+        all_embs = matrix[all_indices_raw].astype(np.float32)
+        g = all_embs.mean(axis=0)
+        g /= (np.linalg.norm(g) + 1e-8)
+        sims_g = all_embs @ g
+        cutoff = sims_g.mean() - OUTLIER_SIGMA * sims_g.std()
+        keep = {all_indices_raw[i] for i, s in enumerate(sims_g) if s >= cutoff}
+        bucket_rows = {k: [i for i in v if i in keep] for k, v in bucket_rows.items()}
+        bucket_rows = {k: v for k, v in bucket_rows.items() if v}
+    n_outliers = n_total - sum(len(v) for v in bucket_rows.values())
+
+    # Time-bucketed centroids
     buckets = []
     for key, indices in sorted(bucket_rows.items()):
-        sub = matrix[indices]
-        centroid = sub.mean(axis=0).astype(np.float32)
+        sub = matrix[indices].astype(np.float32)
+        centroid = sub.mean(axis=0)
         norm = np.linalg.norm(centroid)
         if norm > 0:
             centroid = centroid / norm
@@ -122,14 +163,38 @@ def build_brain_dict(
             "centroid": centroid.tolist(),
         })
 
+    # Appearance centroids: K-means over all cleaned faces, capturing visual
+    # modes that cross time boundaries. Added as "appearance:N" bucket keys;
+    # the read-side picks them up automatically.
+    all_clean = [i for v in bucket_rows.values() for i in v]
+    if len(all_clean) >= APPEARANCE_MIN_FACES:
+        K = min(APPEARANCE_K_MAX, max(2, len(all_clean) // APPEARANCE_PER_CENTROID))
+        X = matrix[all_clean].astype(np.float32)
+        app_centroids = kmeans_centroids(X, K)
+        labels = (X @ app_centroids.T).argmax(axis=1)
+        for k, c in enumerate(app_centroids):
+            n_k = int((labels == k).sum())
+            if n_k == 0:
+                continue
+            radius_k = float(1.0 - (X[labels == k] @ c).mean()) if n_k >= 2 else 0.0
+            buckets.append({
+                "key":      f"appearance:{k}",
+                "n":        n_k,
+                "radius":   radius_k,
+                "centroid": c.tolist(),
+            })
+
+    n_app = sum(1 for b in buckets if b["key"].startswith("appearance:"))
     return {
         "person_id":         person_id,
         "person_name":       person_name,
         "dob_year":          dob_year,
         "updated_at":        datetime.utcnow().isoformat() + "Z",
         "n_confirmed_total": n_total,
+        "n_outliers_removed": n_outliers,
         "missing_embedding": missing,
         "buckets":           buckets,
+        "n_appearance_centroids": n_app,
         "negative_examples": prior_negatives or [],
     }
 

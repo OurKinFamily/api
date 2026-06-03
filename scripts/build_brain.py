@@ -37,6 +37,8 @@ from app.config import settings
 
 COLD_START_MIN = 1
 BUCKET_YEARS = 5
+# Centroid/outlier tuning lives in app.services.brain (single source of truth);
+# this script delegates per-person building to build_brain_dict there.
 
 PHOTOS_ROOT = settings.photos_root
 EMB_NPY = PHOTOS_ROOT / "__faces" / "clusters" / "embeddings.npy"
@@ -130,52 +132,16 @@ def build_brain_for_person(
     matrix: np.ndarray,
     lookup: dict[tuple[str, int], int],
 ) -> dict | None:
-    dob_year = parse_dob_year(dob)
-
-    bucket_rows: dict[str, list[int]] = defaultdict(list)
-    missing_embedding = 0
-    for r in rows:
-        pp = strip_root(r["pp"])
-        fi = int(r["fi"])
-        idx = lookup.get((pp, fi))
-        if idx is None:
-            missing_embedding += 1
-            continue
-        bucket_rows[bucket_key(dob_year, parse_year(r.get("ts")))].append(idx)
-
-    n_total = sum(len(v) for v in bucket_rows.values())
-    if n_total < COLD_START_MIN:
-        return {"_skip": True, "n_total": n_total, "missing_embedding": missing_embedding}
-
-    buckets = []
-    for key, indices in sorted(bucket_rows.items()):
-        sub = matrix[indices]
-        centroid = sub.mean(axis=0).astype(np.float32)
-        norm = np.linalg.norm(centroid)
-        if norm > 0:
-            centroid = centroid / norm
-        if len(indices) >= 2:
-            sims = sub @ centroid
-            radius = float(1.0 - sims.mean())
-        else:
-            radius = 0.0
-        buckets.append({
-            "key": key,
-            "n": len(indices),
-            "radius": radius,
-            "centroid": centroid.tolist(),
-        })
-
-    return {
-        "person_id": pid,
-        "person_name": pname,
-        "dob_year": dob_year,
-        "updated_at": datetime.utcnow().isoformat() + "Z",
-        "n_confirmed_total": n_total,
-        "missing_embedding": missing_embedding,
-        "buckets": buckets,
-        "negative_examples": [],
-    }
+    """Delegates to app.services.brain.build_brain_dict so this offline full
+    rebuild and the live per-confirm rebuild (faces router → rebuild_person_brain)
+    share ONE implementation. Do not reimplement centroid logic here — it caused
+    a drift bug where confirming faces reverted a person to the old brain shape.
+    """
+    from app.services.brain import build_brain_dict, read_negatives
+    brain = build_brain_dict(pid, pname, dob, rows, matrix, lookup, read_negatives(pid))
+    if brain is None:
+        return {"_skip": True, "n_total": 0, "missing_embedding": 0}
+    return brain
 
 
 def merge_negatives(brain: dict, brain_path: Path) -> dict:
@@ -242,11 +208,14 @@ async def main() -> int:
 
         path = BRAIN_DIR / f"{pid}.json"
         brain = merge_negatives(brain, path)
+        n_time = len(brain["buckets"]) - brain.get("n_appearance_centroids", 0)
+        n_app  = brain.get("n_appearance_centroids", 0)
+        outliers = brain.get("n_outliers_removed", 0)
         log(
             f"  brain {pid[:8]}.. {meta['pname'] or '?':24} "
-            f"n={brain['n_confirmed_total']:>5} buckets={len(brain['buckets'])} "
-            f"keys={','.join(b['key'] for b in brain['buckets'][:4])}"
-            + ("..." if len(brain["buckets"]) > 4 else "")
+            f"n={brain['n_confirmed_total']:>5} "
+            f"time={n_time} app={n_app}"
+            + (f" outliers={outliers}" if outliers else "")
         )
         if not args.dry_run:
             path.write_text(json.dumps(brain, indent=2))
