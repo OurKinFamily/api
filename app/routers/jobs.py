@@ -127,7 +127,14 @@ def _run_job(run_id: str, cmd: str, log_path: Path):
 
     active_processes.pop(run_id, None)
     run = load_run(run_id)
-    run["status"]      = "completed" if exit_code == 0 else ("cancelled" if exit_code == -15 else "failed")
+    # exit 0 = clean, 2 = finished but some files errored (warnings), -15 = SIGTERM
+    # (cancelled), anything else = real failure.
+    run["status"] = (
+        "completed" if exit_code == 0
+        else "completed_with_warnings" if exit_code == 2
+        else "cancelled" if exit_code == -15
+        else "failed"
+    )
     run["exit_code"]   = exit_code
     run["finished_at"] = datetime.now().isoformat(timespec="seconds")
     save_run(run)

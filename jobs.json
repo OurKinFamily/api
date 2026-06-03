@@ -5,7 +5,7 @@
     "description": "Detect faces in images and videos, write .faces.json sidecars",
     "color": "#8b5cf6",
     "whenToRun": "STEP 1 of the face pipeline. Run after dropping new photos/videos into /photos/archive. Opens each file, finds faces, writes a .faces.json sidecar next to it. Videos are sampled at N frames and faces deduped across frames. Without this, new media has no faces detected. Narrow to a year/month dir for incremental runs. Use --force only if you want to redo sidecars that already exist (rare).",
-    "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python extract_faces.py {path} {recursive} {force} --model {model} --frames {frames} --dedup-threshold {dedup_threshold}",
+    "shell_command": "cd /home/stephen/Documents/ourkin/workshop/services/face-recognition && source venv/bin/activate && python extract_faces.py {path} {recursive} {force} --model {model} --frames {frames} --dedup-threshold {dedup_threshold}",
     "params": [
       {
         "name": "path",
@@ -60,7 +60,7 @@
     "description": "Run DBSCAN on .faces.json embeddings, write clusters.json, auto-assign to known people",
     "color": "#6366f1",
     "whenToRun": "STEP 3 of the face pipeline. Run after Face Detection if you want new faces to surface on /manage/faces/unassigned. Groups all face embeddings into clusters (Stephen's faces in one bucket, Patty's in another, etc.). Without this, new faces are detected but never appear as something you can label. Safe to re-run — assigned + skipped faces are tracked in Neo4j separately and get filtered out automatically, so re-clustering won't lose work. ~1 minute.",
-    "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python cluster_faces.py --eps {eps} --min-samples {min_samples} --threshold {threshold} {auto_assign}",
+    "shell_command": "cd /home/stephen/Documents/ourkin/workshop/services/face-recognition && source venv/bin/activate && python cluster_faces.py --eps {eps} --min-samples {min_samples} --threshold {threshold} {auto_assign}",
     "params": [
       {
         "name": "eps",
@@ -101,7 +101,7 @@
     "description": "Read all .faces.json sidecars, write embeddings.npy + faces_meta.json for similarity search",
     "color": "#a78bfa",
     "whenToRun": "STEP 2 of the face pipeline. Run after Face Detection if you want the new faces searchable. Collects all face embeddings from every sidecar into one big embeddings.npy file — used by /manage/faces/similar (the 'find matches for this person' workflow). Without this, similarity search won't see the newly-detected faces. Rebuilds the whole index every time (~few minutes on the full archive). Skip unless you actually need similarity search to be current.",
-    "shell_command": "cd /home/stephen/photo-intelligence/services/face-recognition && source venv/bin/activate && python build_embedding_index.py",
+    "shell_command": "cd /home/stephen/Documents/ourkin/workshop/services/face-recognition && source venv/bin/activate && python build_embedding_index.py",
     "params": []
   },
   {
@@ -110,7 +110,7 @@
     "description": "Run YOLO on archive (images + videos), write .objects.json sidecars",
     "color": "#f59e0b",
     "whenToRun": "Run after dropping new photos/videos into /photos/archive. Writes a .objects.json sidecar listing every detected object (people, animals, vehicles, etc.) with bounding boxes. Independent of the face pipeline — no need to run before/after. Narrow the path for incremental runs.",
-    "shell_command": "cd /home/stephen/photo-intelligence/services/object-detection && source venv/bin/activate && python detect_objects.py {path} {recursive} {force} --model {model} --confidence {confidence} --frames {frames}",
+    "shell_command": "cd /home/stephen/Documents/ourkin/workshop/services/object-detection && source venv/bin/activate && python detect_objects.py {path} {recursive} {force} --model {model} --confidence {confidence} --frames {frames}",
     "params": [
       {
         "name": "path",
@@ -165,7 +165,7 @@
     "description": "Extract CLIP semantic embeddings, write .clip.json sidecars",
     "color": "#06b6d4",
     "whenToRun": "Run after dropping new photos into /photos/archive. Writes a .clip.json sidecar with a semantic embedding per image — used for natural-language search (\"dog at beach\", \"birthday cake\"). Independent of the face / object pipelines. Narrow the path for incremental runs.",
-    "shell_command": "cd /home/stephen/photo-intelligence/services/content-understanding && source venv/bin/activate && python extract_clip.py {path} {recursive} {force} --model {model}",
+    "shell_command": "cd /home/stephen/Documents/ourkin/workshop/services/content-understanding && source venv/bin/activate && python extract_clip.py {path} {recursive} {force} --model {model}",
     "params": [
       {
         "name": "path",
@@ -206,7 +206,7 @@
     "description": "Extract DINOv2 scene embeddings, write .scenes.json sidecars",
     "color": "#10b981",
     "whenToRun": "Run after dropping new photos into /photos/archive. Writes a .scenes.json sidecar with a DINOv2 scene embedding — used for visual-similarity search (\"more photos that LOOK like this one\", regardless of subject). Independent of other pipelines. Narrow the path for incremental runs.",
-    "shell_command": "cd /home/stephen/photo-intelligence/services/scene-recognition && source venv/bin/activate && python extract_scenes.py {path} {recursive} {force} --model {model}",
+    "shell_command": "cd /home/stephen/Documents/ourkin/workshop/services/scene-recognition && source venv/bin/activate && python extract_scenes.py {path} {recursive} {force} --model {model}",
     "params": [
       {
         "name": "path",
@@ -247,7 +247,7 @@
     "description": "Scan archive metadata and regenerate report.json for Admin Overview",
     "color": "#64748b",
     "whenToRun": "Run when the /admin/overview page numbers look stale — e.g. after a big import or after any of the extractor jobs above finish. Scans every file's metadata and recounts coverage stats. ~couple minutes. Safe to run any time.",
-    "shell_command": "cd /home/stephen/photo-intelligence && python mm.py report {path} {summary} {verbose} -o {output}",
+    "shell_command": "cd /home/stephen/Documents/ourkin/workshop && python3 mm/mm.py report {path} {summary} {verbose} -o {output}",
     "params": [
       {
         "name": "path",
