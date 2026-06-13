@@ -184,11 +184,27 @@ def _build_cluster_index() -> None:
         _cluster_idx_mtime = mtime
 
 
+# Parsed-JSON cache keyed by path → (mtime, data). clusters.json is now ~96MB
+# (181k clusters at min_samples=1); re-parsing it on every request — and it's
+# touched by grouped/count/leftover/assign/get_cluster — blocked the async event
+# loop for seconds each call, starving thumbnail serving. Cache by mtime so the
+# 96MB parse happens once per file change. The cluster job / purge script bump
+# the mtime when they rewrite, so the cache self-invalidates.
+_load_cache: dict[str, tuple[float, object]] = {}
+
+
 def _load(path: Path, default):
     if not path.exists():
         return default
     try:
-        return json.loads(path.read_text())
+        mtime = path.stat().st_mtime
+        key = str(path)
+        hit = _load_cache.get(key)
+        if hit is not None and hit[0] == mtime:
+            return hit[1]
+        data = json.loads(path.read_text())
+        _load_cache[key] = (mtime, data)
+        return data
     except Exception:
         return default
 
@@ -196,6 +212,12 @@ def _load(path: Path, default):
 def _save(path: Path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2))
+    # Write through the parsed-JSON cache so the next _load sees fresh data
+    # without re-parsing, and never returns a stale pre-save copy.
+    try:
+        _load_cache[str(path)] = (path.stat().st_mtime, data)
+    except OSError:
+        _load_cache.pop(str(path), None)
 
 
 def _crop_url(crop_path: str) -> str:
@@ -471,6 +493,37 @@ async def _get_connection_ids(person_id: str) -> set[str]:
         return {r["cid"] for r in await result.data()}
 
 
+async def _resolve_real_paths(paths: list[str]) -> dict[str, str]:
+    """Map face-index photo_paths → real Media-node paths.
+
+    The face index records a photo by its DATE-bucket path (archive/2025/12/…),
+    but mis-dated files live at archive/0000/…, so those paths match no node and
+    don't exist on disk (broken lightbox image, empty photo-meta). This maps each
+    given path to the actual node path: identity when it already matches, else by
+    unique filename. Paths with no/ambiguous match are omitted.
+    """
+    if not paths:
+        return {}
+    bases = {p: p.rsplit("/", 1)[-1] for p in paths}
+    async with get_session() as session:
+        result = await session.run(
+            """
+            UNWIND $rows AS row
+            OPTIONAL MATCH (exact:Media {path: row.path})
+            CALL {
+                WITH row
+                MATCH (alt:Media {filename: row.base})
+                RETURN collect(alt.path) AS alts
+            }
+            WITH row, coalesce(exact.path, CASE WHEN size(alts) = 1 THEN alts[0] END) AS real
+            WHERE real IS NOT NULL
+            RETURN row.path AS given, real
+            """,
+            rows=[{"path": p, "base": b} for p, b in bases.items()],
+        )
+        return {r["given"]: r["real"] for r in await result.data()}
+
+
 async def _get_photo_meta(paths: list[str]) -> dict[str, dict]:
     """Fetch timestamp + GPS for a list of photo paths."""
     if not paths:
@@ -564,6 +617,11 @@ async def search_similar_faces_temporal(body: SearchByPersonTemporalBody):
         if ts and not str(ts).startswith("1700"):
             try:
                 dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                # Timestamps are a mix of tz-aware (…Z) and naive (no tz) across
+                # the archive; normalise to UTC-aware so the sort + span math
+                # below don't blow up comparing naive vs aware datetimes.
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
                 dated.append((pp, dt, idx))
             except ValueError:
                 undated_indices.append(idx)
@@ -644,6 +702,32 @@ async def search_similar_faces_temporal(body: SearchByPersonTemporalBody):
                     "distance":   round(1.0 - sim, 4),
                 }
 
+    if not best:
+        return {"results": [], "total": 0, "faces_used": len(all_indices), "buckets": bucket_info if use_temporal else None}
+
+    # Remap face-index date-bucket paths → real Media-node paths so the
+    # lightbox can load the original image and photo-meta enrichment resolves.
+    # crop_url is unaffected (crops are keyed by their own path). Candidates with
+    # NO resolvable Media node (bio crops, video poster frames — faces were
+    # extracted but there's nothing to attach an APPEARS_IN edge to) are dropped:
+    # they're unassignable, so showing them just produces silent no-op assigns
+    # that reappear forever.
+    real_paths = await _resolve_real_paths(list({r["photo_path"] for r in best.values()}))
+    resolved_best: dict[tuple[str, int], dict] = {}
+    for k, v in best.items():
+        real = real_paths.get(v["photo_path"])
+        if real is None:
+            continue
+        v["photo_path"] = real
+        # Re-apply the exclusion set on the REAL path. The in-loop exclusion
+        # keys off the date-bucket path, but `exclude` (person's faces +
+        # assigned) is real-path keyed — so a just-assigned mis-dated face
+        # slips the loop and would reappear. Drop it now that paths resolved.
+        if body.unassigned_only and v.get("face_index") is not None \
+                and (real, int(v["face_index"])) in exclude:
+            continue
+        resolved_best[k] = v
+    best = resolved_best
     if not best:
         return {"results": [], "total": 0, "faces_used": len(all_indices), "buckets": bucket_info if use_temporal else None}
 
@@ -742,17 +826,31 @@ async def bulk_assign_faces(body: dict, request: Request):
             photo_path = f.get("photo_path", "").replace("/photos/", "", 1)
             crop_path  = f.get("crop_path",  "").replace("/photos/", "", 1) or _canonical_crop_path(photo_path, f.get("face_index"))
             face_index = f.get("face_index")
+            # The face index records a photo by its DATE-bucket path
+            # (e.g. archive/2025/12/…), but mis-dated files live under
+            # archive/0000/… — so an exact path MATCH silently misses and the
+            # assign no-ops. Fall back to the (unique) filename when the exact
+            # path doesn't resolve; bail to `missing` if the filename is
+            # ambiguous so we never assign to the wrong photo.
+            basename = photo_path.rsplit("/", 1)[-1]
             res = await session.run(
                 """
                 MATCH (person:Person {id: $person_id})
-                MATCH (photo:Media {path: $photo_path})
+                OPTIONAL MATCH (exact:Media {path: $photo_path})
+                CALL {
+                    MATCH (alt:Media {filename: $basename})
+                    RETURN collect(alt) AS alts
+                }
+                WITH person, coalesce(exact, CASE WHEN size(alts) = 1 THEN alts[0] END) AS photo
+                WHERE photo IS NOT NULL
                 MERGE (person)-[r:APPEARS_IN {face_index: $face_index}]->(photo)
                 SET r.crop_path  = $crop_path,
-                    r.photo_path = $photo_path
+                    r.photo_path = photo.path
                 RETURN photo.path AS p
                 """,
                 person_id=person_id,
                 photo_path=photo_path,
+                basename=basename,
                 face_index=face_index,
                 crop_path=crop_path,
             )
@@ -1224,11 +1322,26 @@ async def grouped_suggestions(body: GroupedSuggestionsBody):
     unknown_candidates: list[dict] = []
     grouped_unmatched = set()  # cluster_summary indices absorbed into an unknown candidate
     n_unmatched = len(unmatched_indices)
-    if n_unmatched >= body.min_unknown_clusters:
-        sub = cluster_centroids[np.asarray(unmatched_indices)]
+
+    # The pairwise step builds an N×N matrix. At min_cluster_size=1 the unmatched
+    # set is dominated by singletons (one stranger face each) — 140k of them →
+    # 140k² float32 ≈ 73 GiB and an instant OOM. A single face can't be a
+    # "recurring unknown" anyway, so only clusters with ≥2 faces are eligible;
+    # MAX_UNKNOWN_PAIRWISE is a hard backstop (keep the largest, most-likely-real
+    # clusters) so N² stays bounded no matter the input.
+    MAX_UNKNOWN_PAIRWISE = 6000
+    pair_pool = [i for i in unmatched_indices if len(cluster_summary[i]["remaining"]) >= 2]
+    if len(pair_pool) > MAX_UNKNOWN_PAIRWISE:
+        pair_pool.sort(key=lambda i: -len(cluster_summary[i]["remaining"]))
+        pair_pool = pair_pool[:MAX_UNKNOWN_PAIRWISE]
+        log.warning(f"grouped_suggestions: capped unknown-pairwise pool to {MAX_UNKNOWN_PAIRWISE} (of {n_unmatched} unmatched)")
+    n_pool = len(pair_pool)
+
+    if n_pool >= body.min_unknown_clusters:
+        sub = cluster_centroids[np.asarray(pair_pool)]
         pair_sims = sub @ sub.T                          # symmetric, diag=1
         # Union-find over pairs above threshold (i < j to avoid double-edges + diagonal)
-        parent = list(range(n_unmatched))
+        parent = list(range(n_pool))
         def find(x):
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
@@ -1243,13 +1356,13 @@ async def grouped_suggestions(body: GroupedSuggestionsBody):
             union(int(a), int(b))
         # Bucket by root
         groups_local: dict[int, list[int]] = {}
-        for i in range(n_unmatched):
+        for i in range(n_pool):
             groups_local.setdefault(find(i), []).append(i)
         for members in groups_local.values():
             if len(members) < body.min_unknown_clusters:
                 continue
             # Map back to cluster_summary indices
-            cs_indices = [unmatched_indices[m] for m in members]
+            cs_indices = [pair_pool[m] for m in members]
             cluster_entries = []
             total_faces = 0
             for cs_ix in cs_indices:
@@ -1607,6 +1720,80 @@ class AssignBody(BaseModel):
     include: list[list] | None = None
 
 
+class BulkAssignBody(BaseModel):
+    person_id: str
+    cluster_ids: list[str]
+    # Optional faces to exclude across the whole batch (permanent skip).
+    exclude: list[list] | None = None
+
+
+@router.post("/clusters/assign-bulk", status_code=200)
+async def assign_clusters_bulk(body: BulkAssignBody, request: Request):
+    """Assign many clusters to one person in a SINGLE Neo4j sync (one batched
+    write + one brain rebuild). Confirming a min_cluster_size=1 group can span
+    hundreds of singleton clusters — doing one sync per cluster stampedes the
+    transaction-memory pool and rebuilds the same brain hundreds of times. This
+    collapses it to one."""
+    clusters = _load(CLUSTERS_FILE, {})
+    exclude_set = {(row[0], row[1]) for row in (body.exclude or []) if len(row) >= 2}
+
+    # Honor the same "done" set the suggestions UI uses to compute each cluster's
+    # remaining count: faces already assigned (to anyone) or skipped. Without this
+    # the endpoint re-merges the WHOLE cluster — the card shows "10 remaining" but
+    # we'd write all 291, re-touching done faces and, worse, re-assigning ones the
+    # user had deliberately skipped. Match grouped_suggestions' path-stripping.
+    done = set(await _get_neo4j_assigned()) | set(await _get_neo4j_skipped())
+
+    faces: list = []
+    missing: list[str] = []
+    skipped_done = 0
+    for cid in body.cluster_ids:
+        cl = clusters.get(cid)
+        if cl is None:
+            missing.append(cid)
+            continue
+        for f in cl:
+            if (f.get("photo_path"), f.get("face_index")) in exclude_set:
+                continue
+            pp = f.get("photo_path", "") or ""
+            pp = pp.replace("/photos/", "", 1) if pp.startswith("/photos/") else pp
+            fi = f.get("face_index")
+            if not pp or fi is None or (pp, int(fi)) in done:
+                skipped_done += 1
+                continue
+            faces.append(f)
+
+    if exclude_set:
+        await _add_skipped_faces([(p, fi) for p, fi in exclude_set if p])
+
+    # Bust the Neo4j-assigned cache so the next list call sees the new edges.
+    global _neo4j_assigned
+    _neo4j_assigned = None
+
+    # One background sync for the whole group → one batched write, one rebuild.
+    threading.Thread(
+        target=_sync_to_neo4j,
+        args=(body.person_id, faces),
+        daemon=True,
+    ).start()
+
+    person_name = await _get_person_name(body.person_id)
+    log.bind(
+        event="cluster.assigned.bulk",
+        person_id=body.person_id,
+        person_name=person_name,
+        cluster_count=len(body.cluster_ids) - len(missing),
+        count=len(faces),
+        excluded=len(exclude_set),
+        already_done=skipped_done,
+        missing_clusters=len(missing),
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("clusters bulk-assigned to person")
+
+    return {"assigned": len(faces), "clusters": len(body.cluster_ids) - len(missing), "missing": missing}
+
+
 @router.post("/clusters/{cluster_id}/assign", status_code=204)
 async def assign_cluster(cluster_id: str, body: AssignBody, request: Request):
     clusters = _load(CLUSTERS_FILE, {})
@@ -1709,12 +1896,23 @@ async def unskip_cluster(cluster_id: str, request: Request):
     ).info("cluster unskipped")
 
 
+# Serialize Neo4j sync threads. Each assign spawns a background sync that
+# opens its own transactions and rebuilds the person's brain; firing hundreds
+# at once (e.g. confirming a big min_cluster_size=1 group) stacks concurrent
+# transactions past dbms.memory.transaction.total.max (~358 MiB on the small
+# staging heap) → MemoryPoolOutOfMemoryError. One at a time keeps each sync
+# comfortably under the pool. Prefer the bulk endpoint so a whole group is one
+# sync, not one-per-cluster.
+_NEO4J_SYNC_LOCK = threading.Lock()
+
+
 def _sync_to_neo4j(person_id: str, faces: list):
     from neo4j import GraphDatabase
     from app.config import settings as s
     from app.services.brain import rebuild_person_brain_sync
 
     try:
+      with _NEO4J_SYNC_LOCK:
         driver = GraphDatabase.driver(s.neo4j_uri, auth=(s.neo4j_user, s.neo4j_password))
         with driver.session() as session:
             batch = []

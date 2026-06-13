@@ -1,3 +1,4 @@
+import re
 import uuid
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -56,6 +57,24 @@ async def list_people():
         )
         records = await result.data()
         return [Person(**r["p"]) for r in records]
+
+
+@router.get("/with-biography")
+async def people_with_biography():
+    """Slim list of people who have a non-empty biography — for the Biographies
+    index page. Declared before /{person_id} so it isn't captured as an id."""
+    async with get_session() as session:
+        result = await session.run(
+            """
+            MATCH (p:Person)
+            WHERE p.biography IS NOT NULL AND trim(p.biography) <> ''
+            RETURN p.id AS id, p.name AS name, p.known_as AS known_as,
+                   p.avatar AS avatar, p.cover_image AS cover_image,
+                   p.birth_date AS birth_date, p.death_date AS death_date
+            ORDER BY p.name
+            """
+        )
+        return await result.data()
 
 
 @router.post("/", response_model=Person, status_code=201)
@@ -392,6 +411,28 @@ async def set_cover(person_id: str, body: CoverSet, request: Request):
         ).info("cover updated")
 
 
+class BiographyBody(BaseModel):
+    biography: str | None = None
+
+
+@router.put("/{person_id}/biography", status_code=204)
+async def set_biography(person_id: str, body: BiographyBody, request: Request):
+    """Set (or clear, with null) the person's freeform markdown biography.
+    Kept as its own endpoint so the general person-edit form can't wipe it."""
+    async with get_session() as session:
+        result = await session.run(
+            "MATCH (p:Person {id: $id}) SET p.biography = $bio RETURN p.id AS id",
+            id=person_id, bio=body.biography,
+        )
+        if not await result.single():
+            raise HTTPException(status_code=404, detail="Person not found")
+        logger.bind(
+            event="person.biography_updated",
+            person_id=person_id,
+            **_ctx(request),
+        ).info("biography updated")
+
+
 class FaceAssign(BaseModel):
     photo_path: str
     face_index: int
@@ -573,6 +614,13 @@ _LIFE_BUCKETS = [
     (70, 999, "seventies+"),
 ]
 
+# Decade bucket label for the no-birth-date fallback strip, e.g. 1994 -> "1990s".
+_DECADE_RE = re.compile(r"^(\d{4})s$")
+
+
+def _decade_label(ts) -> str:
+    return f"{(ts.year // 10) * 10}s"
+
 
 @router.get("/{person_id}/relationship")
 async def relationship_to_viewer(person_id: str, request: Request, viewer_id: str | None = None):
@@ -727,7 +775,7 @@ def _life_stage_score(p):
     )
 
 
-def _life_stage_tile(label, chosen, age_years, count, locked):
+def _life_stage_tile(label, chosen, age_years, count, locked, age_text=None):
     thumb_url = with_v(
         f"/api/media/{chosen['poster_path']}"
         if chosen.get("is_video") and chosen.get("poster_path")
@@ -736,7 +784,9 @@ def _life_stage_tile(label, chosen, age_years, count, locked):
     crop_path = chosen.get("crop_path")
     return {
         "bucket": label,
-        "age_text": _format_age(age_years),
+        # Caption ribbon. Age buckets format the numeric age; the no-birth-date
+        # fallback passes an explicit decade label (e.g. "1990s").
+        "age_text": age_text if age_text is not None else _format_age(age_years),
         "path": chosen["path"],
         "url": with_v(f"/api/media/{chosen['path']}"),
         "thumb_url": thumb_url,
@@ -779,20 +829,19 @@ async def _fetch_life_stage_pool(session, person_id):
         id=person_id,
     )
     rec = await res.single()
-    if not rec or not rec["birth"]:
+    if not rec:
         return None, [], {}
 
-    birth_dt = _parse_birth(rec["birth"])
-    if not birth_dt:
-        return None, [], {}
+    # birth_dt may be None — the caller falls back to a decade-based strip.
+    birth_dt = _parse_birth(rec["birth"]) if rec.get("birth") else None
 
-    # Death cutoff. Allow a small grace window (1 year) — funeral / memorial
-    # photos within ~12 months are still likely the same era. After that,
-    # exclude.
+    # Death cutoff (only meaningful with a birth date). Allow a small grace
+    # window (1 year) — funeral / memorial photos within ~12 months are still
+    # likely the same era. After that, exclude.
     death_dt = _parse_birth(rec["death"]) if rec.get("death") else None
     max_age = (
         ((death_dt - birth_dt).days / 365.25) + 1.0
-        if death_dt else None
+        if (death_dt and birth_dt) else None
     )
 
     raw_photos = [p for p in rec["photos"] if p.get("path") and p.get("ts")]
@@ -804,12 +853,15 @@ async def _fetch_life_stage_pool(session, person_id):
             )
         except ValueError:
             continue
-        years = (ts - birth_dt).days / 365.25
-        if years < 0:
-            continue
-        if max_age is not None and years > max_age:
-            continue
-        photos.append({**p, "ts_parsed": ts, "age_years": years})
+        if birth_dt is not None:
+            years = (ts - birth_dt).days / 365.25
+            if years < 0:
+                continue
+            if max_age is not None and years > max_age:
+                continue
+            photos.append({**p, "ts_parsed": ts, "age_years": years})
+        else:
+            photos.append({**p, "ts_parsed": ts, "age_years": None})
     stills = [p for p in photos if not p.get("is_video")]
     locked = {row["bucket"]: row["path"] for row in rec["locks"] if row.get("bucket")}
     return birth_dt, stills, locked
@@ -821,6 +873,26 @@ def _sort_bucket(in_bucket):
     return in_bucket
 
 
+def _pick_chosen(in_bucket, locked_path):
+    """Return (chosen_photo, locked_bool). Honors a locked override when the
+    locked photo is still in the pool; otherwise auto-picks the best (the
+    bucket must already be sorted best-first)."""
+    if locked_path:
+        chosen = next((p for p in in_bucket if p["path"] == locked_path), None)
+        if chosen is not None:
+            return chosen, True
+    return in_bucket[0], False  # no lock, or locked photo gone from pool
+
+
+def _decade_buckets(stills):
+    """Group dated stills into decade buckets, oldest decade first. Used for
+    the no-birth-date fallback strip — chronology stands in for age."""
+    groups: dict[str, list] = {}
+    for p in stills:
+        groups.setdefault(_decade_label(p["ts_parsed"]), []).append(p)
+    return [(lbl, groups[lbl]) for lbl in sorted(groups, key=lambda l: int(l[:-1]))]
+
+
 @router.get("/{person_id}/life-stages")
 async def life_stages(person_id: str):
     """For each age bucket (baby → seventies+), pick one representative
@@ -828,23 +900,26 @@ async def life_stages(person_id: str):
     otherwise auto-picks via favorited+solo > solo > favorited > newest."""
     async with get_session() as session:
         birth_dt, stills, locked_by_bucket = await _fetch_life_stage_pool(session, person_id)
-    if birth_dt is None:
+    if not stills:
         return {"buckets": []}
 
     out = []
-    for lo, hi, label in _LIFE_BUCKETS:
-        in_bucket = [p for p in stills if lo <= p["age_years"] <= hi]
-        if not in_bucket:
-            continue
-        _sort_bucket(in_bucket)
-        locked_path = locked_by_bucket.get(label)
-        chosen = None
-        if locked_path:
-            chosen = next((p for p in in_bucket if p["path"] == locked_path), None)
-        if chosen is None:
-            chosen = in_bucket[0]
-            locked_path = None  # locked photo missing from pool → treat as unlocked
-        out.append(_life_stage_tile(label, chosen, chosen["age_years"], len(in_bucket), bool(locked_path)))
+    if birth_dt is not None:
+        # Age buckets: baby → seventies+.
+        for lo, hi, label in _LIFE_BUCKETS:
+            in_bucket = [p for p in stills if lo <= p["age_years"] <= hi]
+            if not in_bucket:
+                continue
+            _sort_bucket(in_bucket)
+            chosen, locked = _pick_chosen(in_bucket, locked_by_bucket.get(label))
+            out.append(_life_stage_tile(label, chosen, chosen["age_years"], len(in_bucket), locked))
+    else:
+        # No birth date → fall back to a chronological "through the years"
+        # strip keyed by photo decade.
+        for label, in_bucket in _decade_buckets(stills):
+            _sort_bucket(in_bucket)
+            chosen, locked = _pick_chosen(in_bucket, locked_by_bucket.get(label))
+            out.append(_life_stage_tile(label, chosen, None, len(in_bucket), locked, age_text=label))
     return {"buckets": out}
 
 
@@ -854,16 +929,31 @@ async def life_stage_candidates(person_id: str, bucket: str, limit: int = 24):
     Drives the 'swap to a different one' UI."""
     async with get_session() as session:
         birth_dt, stills, _ = await _fetch_life_stage_pool(session, person_id)
-    if birth_dt is None:
+    if not stills:
         return {"candidates": []}
-    bracket = next((b for b in _LIFE_BUCKETS if b[2] == bucket), None)
-    if bracket is None:
+
+    if birth_dt is not None:
+        bracket = next((b for b in _LIFE_BUCKETS if b[2] == bucket), None)
+        if bracket is None:
+            raise HTTPException(404, f"Unknown bucket {bucket!r}")
+        lo, hi, _ = bracket
+        in_bucket = [p for p in stills if lo <= p["age_years"] <= hi]
+        _sort_bucket(in_bucket)
+        out = [
+            _life_stage_tile(bucket, p, p["age_years"], len(in_bucket), False)
+            for p in in_bucket[:limit]
+        ]
+        return {"candidates": out}
+
+    # No-birth-date fallback: the bucket is a decade label like "1990s".
+    m = _DECADE_RE.match(bucket)
+    if not m:
         raise HTTPException(404, f"Unknown bucket {bucket!r}")
-    lo, hi, _ = bracket
-    in_bucket = [p for p in stills if lo <= p["age_years"] <= hi]
+    decade = int(m.group(1))
+    in_bucket = [p for p in stills if (p["ts_parsed"].year // 10) * 10 == decade]
     _sort_bucket(in_bucket)
     out = [
-        _life_stage_tile(bucket, p, p["age_years"], len(in_bucket), False)
+        _life_stage_tile(bucket, p, None, len(in_bucket), False, age_text=bucket)
         for p in in_bucket[:limit]
     ]
     return {"candidates": out}

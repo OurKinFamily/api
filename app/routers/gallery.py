@@ -25,10 +25,12 @@ log = logger
 
 VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.m4v', '.mpg', '.mpeg'}
 
+# Exclusive levels: each filter shows ONLY that confidence (not a floor), so
+# "Low" surfaces only the low-confidence items to review/re-date. "all" = no filter.
 CONFIDENCE_SETS = {
     "high":   ["high"],
-    "medium": ["high", "medium"],
-    "low":    ["high", "medium", "low"],
+    "medium": ["medium"],
+    "low":    ["low"],
 }
 
 
@@ -44,11 +46,26 @@ async def list_media(
     sort:           str           = Query(default="desc"),     # desc | asc
     media_type:     str           = Query(default="all"),      # photo | video | all
     person_ids:     Optional[str] = Query(default=None),       # comma-separated person IDs
+    undated:        bool          = Query(default=False),      # only media with NO timestamp ("0000" bucket)
+    gps:            str           = Query(default="both"),     # has | none | both — GPS coordinates present?
+    camera_model:   Optional[str] = Query(default=None),       # exact camera_model match
+    unassigned_faces: bool        = Query(default=False),      # only media with detected-but-unassigned faces
 ):
     conditions = []
     params: dict = {"offset": offset, "limit": limit}
 
-    if min_confidence in CONFIDENCE_SETS:
+    # The gallery grid is photos + videos only. Scrapbook / yearbook / journal
+    # PAGES are :Document nodes — they belong in Collections (the collection
+    # card shows in Scrapbook), not as ~3,400 individual tiles flooding the
+    # grid. Face-crop thumbnails (__faces) are internal artifacts, never items.
+    conditions.append("NOT p:Document")
+    conditions.append("NOT p.path CONTAINS '__faces'")
+
+    if undated:
+        # The "0000" / no-date bucket — scanned albums and the like with no
+        # timestamp at all. Confidence + year filters don't apply here.
+        conditions.append("p.timestamp IS NULL")
+    elif min_confidence in CONFIDENCE_SETS:
         conditions.append("p.timestamp_confidence IN $conf_values")
         params["conf_values"] = CONFIDENCE_SETS[min_confidence]
 
@@ -68,6 +85,29 @@ async def list_media(
         conditions.append("p:Photo")
     elif media_type == "video":
         conditions.append("p:Video")
+
+    # GPS presence — latitude/longitude are set together at extraction time.
+    if gps == "has":
+        conditions.append("p.latitude IS NOT NULL")
+    elif gps == "none":
+        conditions.append("p.latitude IS NULL")
+    # "both" (or anything else) = no GPS condition.
+
+    if camera_model:
+        conditions.append("p.camera_model = $camera_model")
+        params["camera_model"] = camera_model
+
+    # Detected-but-unassigned faces. `face_count` was backfilled from the
+    # .faces.json sidecars (num_faces). A face is "handled" once it's either
+    # assigned (an APPEARS_IN edge carrying its face_index) or skipped
+    # (m.skipped_faces). So unassigned work remains when the detected count
+    # exceeds assigned + skipped.
+    if unassigned_faces:
+        conditions.append(
+            "p.face_count > 0 AND p.face_count > "
+            "size(coalesce(p.skipped_faces, [])) + "
+            "COUNT { (p)<-[r:APPEARS_IN]-(:Person) WHERE r.face_index IS NOT NULL }"
+        )
 
     ids = [i.strip() for i in person_ids.split(",") if i.strip()] if person_ids else []
     if ids:
@@ -193,6 +233,271 @@ async def redate_media(request: Request, path: str = Query(...), body: RedateBod
     return media
 
 
+class LocationBody(BaseModel):
+    """Manually assign GPS coordinates to a media file. Trickles to all three
+    stores: the Neo4j node (so the gallery's GPS filter sees it), the .json
+    sidecar (so /gallery/detail renders it), and the file's own EXIF/XMP GPS
+    tags (so it survives re-extraction + travels with the file).
+    """
+    latitude:   float
+    longitude:  float
+    place_name: Optional[str] = None
+
+    @field_validator('latitude')
+    @classmethod
+    def lat_range(cls, v: float) -> float:
+        if not -90 <= v <= 90:
+            raise ValueError("latitude must be between -90 and 90")
+        return v
+
+    @field_validator('longitude')
+    @classmethod
+    def lon_range(cls, v: float) -> float:
+        if not -180 <= v <= 180:
+            raise ValueError("longitude must be between -180 and 180")
+        return v
+
+
+def _write_sidecar_location(sidecar: Path, lat: float, lon: float, place_name: Optional[str]) -> None:
+    """Set location.primary (+ optional geolocation.city) in the .json sidecar,
+    matching the shape /gallery/detail reads (results[0].metadata or metadata)."""
+    data = json.loads(sidecar.read_text()) if sidecar.exists() else {}
+
+    # Pre-existing keys can be present-but-null (e.g. "location": null), so
+    # setdefault won't help — coerce each level to a dict explicitly.
+    def _dict_at(parent: dict, key: str) -> dict:
+        v = parent.get(key)
+        if not isinstance(v, dict):
+            v = {}
+            parent[key] = v
+        return v
+
+    results = data.get("results")
+    container = results[0] if isinstance(results, list) and results and isinstance(results[0], dict) else data
+    meta = _dict_at(container, "metadata")
+    loc = _dict_at(meta, "location")
+    loc["primary"] = {
+        "latitude": lat,
+        "longitude": lon,
+        "source": "manual",
+        "sourceDetails": "Manually set in app",
+    }
+    if place_name:
+        _dict_at(loc, "geolocation")["city"] = place_name
+    sidecar.write_text(json.dumps(data, indent=2))
+
+
+def _write_exif_gps(full_path: Path, lat: float, lon: float) -> bool:
+    """Write GPS into the file. Images use the standard EXIF GPS block; videos
+    use XMP-exif (QuickTime EXIF GPS is unreliable). Refs come from the sign;
+    values are absolute."""
+    import subprocess
+    lat_ref = "N" if lat >= 0 else "S"
+    lon_ref = "E" if lon >= 0 else "W"
+    prefix = "XMP-exif:" if full_path.suffix.lower() in VIDEO_EXTS else ""
+    tags = [
+        f"-{prefix}GPSLatitude={abs(lat)}",  f"-{prefix}GPSLatitudeRef={lat_ref}",
+        f"-{prefix}GPSLongitude={abs(lon)}", f"-{prefix}GPSLongitudeRef={lon_ref}",
+    ]
+    try:
+        r = subprocess.run(["exiftool", "-overwrite_original", *tags, str(full_path)],
+                           capture_output=True, text=True, timeout=60)
+        return r.returncode == 0
+    except Exception as e:
+        log.warning(f"exiftool GPS write failed for {full_path}: {e}")
+        return False
+
+
+async def _apply_location(session, path: str, lat: float, lon: float, place_name: Optional[str]) -> dict:
+    """Trickle one file's GPS to graph + sidecar + EXIF. Shared by the single
+    and bulk endpoints. Returns a per-item result dict (never raises)."""
+    full_path = settings.photos_root / path
+    if not full_path.exists():
+        return {"path": path, "ok": False, "error": "file not found"}
+    result = await session.run(
+        """
+        MATCH (m:Media {path: $path})
+        SET m.original_latitude  = coalesce(m.original_latitude, m.latitude),
+            m.original_longitude = coalesce(m.original_longitude, m.longitude),
+            m.latitude        = $lat,
+            m.longitude       = $lon,
+            m.location_source = 'manual',
+            m.location_city   = coalesce($place_name, m.location_city)
+        RETURN m.path AS path
+        """,
+        path=path, lat=lat, lon=lon, place_name=place_name,
+    )
+    if not await result.single():
+        return {"path": path, "ok": False, "error": "node not found"}
+
+    # Sidecar + EXIF — best-effort. Graph is the filter's source of truth, so a
+    # sidecar/EXIF hiccup doesn't fail the item.
+    sidecar_ok = False
+    try:
+        _write_sidecar_location(Path(str(full_path) + ".json"), lat, lon, place_name)
+        sidecar_ok = True
+    except Exception as e:
+        log.warning(f"sidecar location write failed for {path}: {e}")
+    exif_ok = _write_exif_gps(full_path, lat, lon)
+    return {"path": path, "ok": True, "sidecar_written": sidecar_ok, "exif_written": exif_ok}
+
+
+@router.patch("/media/location")
+async def set_media_location(request: Request, path: str = Query(...), body: LocationBody = ...):
+    """Manually set a media file's GPS. Writes graph + sidecar + EXIF."""
+    full_path = settings.photos_root / path
+    if not full_path.exists():
+        raise HTTPException(404, "Media file not found")
+    async with get_session() as session:
+        res = await _apply_location(session, path, body.latitude, body.longitude, body.place_name)
+    if not res["ok"]:
+        raise HTTPException(404, "Media node not found")
+
+    logger.bind(
+        event="media.located",
+        path=path,
+        latitude=body.latitude,
+        longitude=body.longitude,
+        place_name=body.place_name,
+        sidecar_ok=res["sidecar_written"],
+        exif_ok=res["exif_written"],
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("media located")
+    return {
+        "path": path,
+        "latitude": body.latitude,
+        "longitude": body.longitude,
+        "place_name": body.place_name,
+        "source": "manual",
+        "sidecar_written": res["sidecar_written"],
+        "exif_written": res["exif_written"],
+    }
+
+
+class BulkLocationBody(LocationBody):
+    paths: list[str]
+
+
+class BulkRedateBody(RedateBody):
+    paths: list[str]
+
+
+@router.patch("/media/location/bulk")
+async def bulk_set_location(request: Request, body: BulkLocationBody):
+    """Set the same GPS on many files at once — graph + sidecar + EXIF each,
+    exactly like the single endpoint. Returns per-item ok/failed."""
+    import uuid
+    bulk_id = uuid.uuid4().hex[:12]
+    results = []
+    async with get_session() as session:
+        for p in body.paths:
+            results.append(await _apply_location(session, p, body.latitude, body.longitude, body.place_name))
+    ok = [r for r in results if r["ok"]]
+    logger.bind(
+        event="media.located_bulk",
+        bulk_id=bulk_id,
+        count=len(ok),
+        requested=len(body.paths),
+        latitude=body.latitude, longitude=body.longitude, place_name=body.place_name,
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("media located (bulk)")
+    return {"updated": len(ok), "requested": len(body.paths), "results": results}
+
+
+async def _apply_redate(session, path: str, timestamp: str, precision: str) -> bool:
+    """Graph-only soft redate (EXIF + sidecar untouched, matching the single
+    redate's design). Returns True if the node was found + updated."""
+    result = await session.run(
+        """
+        MATCH (m:Media {path: $path})
+        SET m.original_timestamp   = coalesce(m.original_timestamp, m.timestamp),
+            m.timestamp            = $timestamp,
+            m.timestamp_source     = 'manual',
+            m.timestamp_confidence = 'high',
+            m.timestamp_precision  = $precision
+        RETURN m.path AS path
+        """,
+        path=path, timestamp=timestamp, precision=precision,
+    )
+    return bool(await result.single())
+
+
+@router.patch("/media/bulk")
+async def bulk_redate(request: Request, body: BulkRedateBody):
+    """Set the same capture date on many files at once (graph-only, like the
+    single redate). Returns per-item ok/failed."""
+    import uuid
+    bulk_id = uuid.uuid4().hex[:12]
+    results = []
+    async with get_session() as session:
+        for p in body.paths:
+            ok = await _apply_redate(session, p, body.timestamp, body.precision)
+            results.append({"path": p, "ok": ok})
+    ok = [r for r in results if r["ok"]]
+    logger.bind(
+        event="media.redated_bulk",
+        bulk_id=bulk_id,
+        count=len(ok),
+        requested=len(body.paths),
+        timestamp=body.timestamp, precision=body.precision,
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("media redated (bulk)")
+    return {"updated": len(ok), "requested": len(body.paths), "results": results}
+
+
+@router.get("/place-shortcuts")
+async def place_shortcuts():
+    """Known place → coords from the mmp config (Stephen's quick-picks). Empty
+    when the config isn't present (e.g. deployed container)."""
+    cfg = Path.home() / ".config" / "mmp" / "config.json"
+    out = []
+    try:
+        locs = json.loads(cfg.read_text()).get("shortcuts", {}).get("locations", {})
+        for name, coords in locs.items():
+            try:
+                lat, lon = (float(x) for x in str(coords).split(","))
+                out.append({"name": name, "latitude": lat, "longitude": lon})
+            except (ValueError, TypeError):
+                continue
+    except Exception:
+        pass
+    return sorted(out, key=lambda p: p["name"])
+
+
+@router.get("/geocode")
+async def geocode(q: str = Query(..., min_length=2)):
+    """Free-text place → candidate coordinates via OpenStreetMap Nominatim, so
+    the location editor accepts "Haverhill, MA" instead of raw lat/lon. Returns
+    up to 5 candidates (display_name + lat/lon)."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": q, "format": "json", "limit": 5},
+                headers={"User-Agent": "ourkin-family-archive/1.0 (personal, non-commercial)"},
+            )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        log.warning(f"geocode failed for {q!r}: {e}")
+        raise HTTPException(502, "Geocoding service unavailable")
+    out = []
+    for d in data:
+        try:
+            out.append({
+                "display_name": d.get("display_name"),
+                "latitude": float(d["lat"]),
+                "longitude": float(d["lon"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
 @router.delete("/media", status_code=204)
 async def delete_media(request: Request, path: str = Query(...)):
     """Soft-delete a Media node + its file + all sidecar siblings. The
@@ -256,18 +561,42 @@ async def delete_media(request: Request, path: str = Query(...)):
 @router.get("/years")
 async def list_years(min_confidence: str = Query(default="high")):
     """Distinct years that have media, with counts. Used by the date scrubber."""
-    conf = CONFIDENCE_SETS.get(min_confidence, CONFIDENCE_SETS["high"])
-    q = """
+    # min_confidence not in the set (e.g. "all") = no confidence filter, so
+    # undated / NULL-confidence media (scanned albums etc.) become visible too.
+    conf = CONFIDENCE_SETS.get(min_confidence)
+    where = "p.timestamp IS NOT NULL"
+    qparams: dict = {}
+    if conf is not None:
+        where = "p.timestamp_confidence IN $conf AND " + where
+        qparams["conf"] = conf
+    q = f"""
         MATCH (p:Media)
-        WHERE p.timestamp_confidence IN $conf AND p.timestamp IS NOT NULL
+        WHERE {where}
         WITH substring(toString(p.timestamp), 0, 4) AS year
         RETURN year, count(*) AS count
         ORDER BY year DESC
     """
     async with get_session() as session:
-        res = await session.run(q, conf=conf)
+        res = await session.run(q, **qparams)
         rows = await res.data()
     return [{"year": int(r["year"]), "count": r["count"]} for r in rows if r["year"].isdigit()]
+
+
+@router.get("/cameras")
+async def list_cameras():
+    """Distinct camera models with counts — populates the gallery filter
+    dropdown. Documents / face-crops excluded (consistent with the grid)."""
+    q = """
+        MATCH (p:Media)
+        WHERE p.camera_model IS NOT NULL
+          AND NOT p:Document AND NOT p.path CONTAINS '__faces'
+        RETURN p.camera_make AS make, p.camera_model AS model, count(*) AS count
+        ORDER BY count DESC
+    """
+    async with get_session() as session:
+        res = await session.run(q)
+        rows = await res.data()
+    return [{"make": r["make"], "model": r["model"], "count": r["count"]} for r in rows]
 
 
 @router.get("/detail")
@@ -369,22 +698,27 @@ async def media_detail(path: str = Query(...)):
                 p["bbox"]     = bbox_by_index.get(p.get("face_index"))
                 p["crop_url"] = with_v(f"/api/media/{p['crop_path']}") if p.get("crop_path") else None
 
-            # Derive crop paths for faces not yet assigned to anyone
+            # Faces not yet assigned to anyone. Use the crop_path the worker
+            # recorded in the sidecar — it stores crops by the photo's date,
+            # which can differ from the file's archive/YYYY/MM path (e.g.
+            # archive/0000/ junk-date photos), and that path may have only 3
+            # parts. Reconstructing from the file path crashed / mismatched.
             assigned_indexes = {p.get("face_index") for p in people}
-            parts = Path(path).parts  # ('archive', '2026', '04', 'file.jpg')
-            year, month, fname = parts[1], parts[2], parts[3]
+            root = str(settings.photos_root)
             for face in fd.get("faces", []):
-                fi = face["face_index"]
+                fi = face.get("face_index")
                 if fi in assigned_indexes:
                     continue
-                crop_path = f"__faces/crops/{year}/{month}/{fname}_face{fi}.jpg"
-                crop_full = settings.photos_root / crop_path
-                if crop_full.exists():
+                cp = face.get("crop_path")
+                if not cp:
+                    continue
+                crop_rel = cp.removeprefix(root + "/").removeprefix("/photos/").lstrip("/")
+                if (settings.photos_root / crop_rel).exists():
                     unidentified.append({
                         "face_index": fi,
                         "bbox":       face.get("bbox"),
-                        "crop_path":  crop_path,
-                        "crop_url":   with_v(f"/api/media/{crop_path}"),
+                        "crop_path":  crop_rel,
+                        "crop_url":   with_v(f"/api/media/{crop_rel}"),
                         "confidence": face.get("confidence"),
                     })
         except Exception as e:
@@ -430,6 +764,18 @@ async def media_detail(path: str = Query(...)):
                 "source":     "manual",
                 "confidence": media_node.get("timestamp_confidence", "high"),
                 "precision":  media_node.get("timestamp_precision", "day"),
+            }
+            meta.setdefault("timestamps", {})["primary"] = ts
+        # Otherwise the graph node's timestamp_confidence is still authoritative
+        # over the sidecar's: it reflects archive/0000 date-conflict downgrades
+        # the sidecar (a naive EXIF read) never saw. Without this the lightbox
+        # shows "high" for a file the gallery filtered as "low" — the same file
+        # contradicting itself. Surface the graph value so they agree.
+        elif media_node.get("timestamp_confidence"):
+            ts = {
+                "timestamp":  media_node.get("timestamp") or ts.get("timestamp"),
+                "source":     media_node.get("timestamp_source") or ts.get("source"),
+                "confidence": media_node.get("timestamp_confidence"),
             }
             meta.setdefault("timestamps", {})["primary"] = ts
         loc_block   = meta.get("location", {})
