@@ -42,3 +42,4 @@ class Person(BaseModel):
     cover_position: Optional[str] = None  # 'fit' (default) | 'top' | 'center' | 'bottom'
     email: Optional[str] = None
     biography: Optional[str] = None  # freeform markdown; inline ![caption](path) images float alongside the text
+    bio_private: bool = False  # when true, the biography is hidden from non-admin family viewers

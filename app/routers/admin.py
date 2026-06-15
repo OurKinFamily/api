@@ -1734,9 +1734,10 @@ async def me(request: Request):
             email=email,
         )
         row = await result.single()
-    from app.deps import is_admin_email
+    from app.deps import is_admin_email, can_see_gallery
     return {
-        "email":    email,
-        "is_admin": is_admin_email(email),
-        "person":   dict(row) if row else None,
+        "email":           email,
+        "is_admin":        is_admin_email(email),
+        "can_see_gallery": can_see_gallery(email),
+        "person":          dict(row) if row else None,
     }

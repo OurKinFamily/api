@@ -44,33 +44,74 @@ async def search_people(q: str, limit: int = 20):
 
 
 @router.get("/", response_model=list[Person])
-async def list_people():
+async def list_people(request: Request, viewer_id: str | None = None):
+    """People list. When we can tell who's viewing (their Cloudflare email maps
+    to a Person, or an admin passes ?viewer_id to preview), the list is ordered
+    by closeness to them — their own family first, then anyone sharing their
+    surname (e.g. all the Dezazzos for a Dezazzo), then everyone else. Falls back
+    to photo-count ordering when there's no known viewer."""
+    from app.routers.me import _current_email
+    from app.deps import is_admin_email
+    email = _current_email(request)
     async with get_session() as session:
-        result = await session.run(
-            """
-            MATCH (p:Person)
-            OPTIONAL MATCH (p)-[:APPEARS_IN]->(m:Media)
-            WITH p, count(m) AS photo_count
-            RETURN p
-            ORDER BY photo_count DESC, p.name
-            """
-        )
+        vid = None
+        if viewer_id and is_admin_email(email):
+            vid = viewer_id
+        elif email:
+            r = await session.run("MATCH (p:Person {email: $e}) RETURN p.id AS id", e=email)
+            row = await r.single()
+            vid = row.get("id") if row else None
+
+        if vid:
+            result = await session.run(
+                """
+                MATCH (viewer:Person {id: $vid})
+                OPTIONAL MATCH (viewer)-[:PARENT_OF|MARRIED_TO*1..4]-(kin:Person)
+                WITH viewer, collect(DISTINCT kin.id) AS kin_ids,
+                     last(split(viewer.name, ' ')) AS surname
+                MATCH (p:Person)
+                OPTIONAL MATCH (p)-[:APPEARS_IN]->(m:Media)
+                WITH p, viewer, kin_ids, surname, count(m) AS photo_count
+                RETURN p,
+                  CASE
+                    WHEN p.id = viewer.id THEN 0
+                    WHEN p.id IN kin_ids THEN 1
+                    WHEN surname <> '' AND p.name CONTAINS surname THEN 2
+                    ELSE 3
+                  END AS tier, photo_count
+                ORDER BY tier, photo_count DESC, p.name
+                """,
+                vid=vid,
+            )
+        else:
+            result = await session.run(
+                """
+                MATCH (p:Person)
+                OPTIONAL MATCH (p)-[:APPEARS_IN]->(m:Media)
+                WITH p, count(m) AS photo_count
+                RETURN p ORDER BY photo_count DESC, p.name
+                """
+            )
         records = await result.data()
         return [Person(**r["p"]) for r in records]
 
 
 @router.get("/with-biography")
-async def people_with_biography():
+async def people_with_biography(request: Request):
     """Slim list of people who have a non-empty biography — for the Biographies
     index page. Declared before /{person_id} so it isn't captured as an id."""
+    from app.deps import is_admin_request
+    # Family viewers don't see bios the owner marked private.
+    priv_filter = "" if is_admin_request(request) else "AND NOT coalesce(p.bio_private, false)"
     async with get_session() as session:
         result = await session.run(
-            """
+            f"""
             MATCH (p:Person)
-            WHERE p.biography IS NOT NULL AND trim(p.biography) <> ''
+            WHERE p.biography IS NOT NULL AND trim(p.biography) <> '' {priv_filter}
             RETURN p.id AS id, p.name AS name, p.known_as AS known_as,
                    p.avatar AS avatar, p.cover_image AS cover_image,
-                   p.birth_date AS birth_date, p.death_date AS death_date
+                   p.birth_date AS birth_date, p.death_date AS death_date,
+                   coalesce(p.bio_private, false) AS bio_private
             ORDER BY p.name
             """
         )
@@ -229,7 +270,7 @@ async def people_timeline(min_photos: int = Query(default=30, ge=1)):
 
 
 @router.get("/{person_id}", response_model=Person)
-async def get_person(person_id: str):
+async def get_person(person_id: str, request: Request):
     async with get_session() as session:
         result = await session.run(
             "MATCH (p:Person {id: $id}) RETURN p",
@@ -238,7 +279,13 @@ async def get_person(person_id: str):
         record = await result.single()
         if not record:
             raise HTTPException(status_code=404, detail="Person not found")
-        return Person(**record["p"])
+        from app.deps import is_admin_request
+        props = dict(record["p"])
+        # Hide the biography from family viewers when the owner marked it private.
+        # The person otherwise stays fully visible (tree, photos, relationships).
+        if props.get("bio_private") and not is_admin_request(request):
+            props["biography"] = None
+        return Person(**props)
 
 
 @router.get("/{person_id}/connection-timeline")
@@ -431,6 +478,29 @@ async def set_biography(person_id: str, body: BiographyBody, request: Request):
             person_id=person_id,
             **_ctx(request),
         ).info("biography updated")
+
+
+class BioPrivateBody(BaseModel):
+    bio_private: bool
+
+
+@router.patch("/{person_id}/bio-private", status_code=204)
+async def set_bio_private(person_id: str, body: BioPrivateBody, request: Request):
+    """Mark a person's biography private (hidden from family viewers) or public.
+    Admin-only — enforced by the write-lock middleware."""
+    async with get_session() as session:
+        result = await session.run(
+            "MATCH (p:Person {id: $id}) SET p.bio_private = $v RETURN p.id AS id",
+            id=person_id, v=body.bio_private,
+        )
+        if not await result.single():
+            raise HTTPException(status_code=404, detail="Person not found")
+        logger.bind(
+            event="person.bio_private_set",
+            person_id=person_id,
+            bio_private=body.bio_private,
+            **_ctx(request),
+        ).info("bio privacy set")
 
 
 class FaceAssign(BaseModel):

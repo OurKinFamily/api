@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from app.db.neo4j import get_session
 from app.config import settings, with_v
 from app.log import logger
+from app.deps import is_admin_request
 
 
 def _ctx(request: Request) -> dict:
@@ -38,6 +39,7 @@ class CollectionUpdate(BaseModel):
     is_series: Optional[bool] = None
     cover_path: Optional[str] = None
     description: Optional[str] = None
+    private: Optional[bool] = None       # owner-only when true
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -87,6 +89,7 @@ def _item_from_node(d: dict) -> dict:
 def _collection_record(rec: dict) -> dict:
     c = dict(rec["c"])
     c["created_at"] = str(c.get("created_at", ""))
+    c["private"] = bool(c.get("private", False))
     if "item_count" in rec:
         c["item_count"] = rec["item_count"]
     return c
@@ -95,14 +98,17 @@ def _collection_record(rec: dict) -> dict:
 # ── Person collections ─────────────────────────────────────────────────────────
 
 @router.get("/people/{person_id}/collections")
-async def get_collections(person_id: str):
+async def get_collections(person_id: str, request: Request):
+    # Family viewers don't see collections the owner marked private.
+    priv_filter = "" if is_admin_request(request) else "WHERE NOT coalesce(c.private, false)"
     async with get_session() as session:
         # A person's scrapbook shows the collections they OWN (grouped),
         # with a live item count. Items they merely appear in are surfaced
         # individually via /people/{id}/items, not as grouped collections.
         result = await session.run(
-            """
-            MATCH (c:Collection)-[:BELONGS_TO]->(p:Person {id: $id})
+            f"""
+            MATCH (c:Collection)-[:BELONGS_TO]->(p:Person {{id: $id}})
+            {priv_filter}
             OPTIONAL MATCH (c)-[:CONTAINS]->(m:Media)
             RETURN c, count(m) AS item_count ORDER BY c.name
             """,
@@ -172,7 +178,7 @@ async def create_collection(person_id: str, body: CollectionCreate, request: Req
 # ── Single collection ──────────────────────────────────────────────────────────
 
 @router.get("/collections/{collection_id}")
-async def get_collection(collection_id: str):
+async def get_collection(collection_id: str, request: Request):
     async with get_session() as session:
         result = await session.run(
             """
@@ -185,6 +191,10 @@ async def get_collection(collection_id: str):
         if not rec:
             raise HTTPException(status_code=404, detail="Collection not found")
         data = _collection_record({"c": rec["c"]})
+        # Private collections are invisible to family viewers (404, not 403, so
+        # their existence isn't even revealed).
+        if data["private"] and not is_admin_request(request):
+            raise HTTPException(status_code=404, detail="Collection not found")
         data["person_id"] = rec["person_id"]
         data["person_name"] = rec["person_known_as"] or rec["person_name"]
         return data
@@ -200,7 +210,7 @@ async def update_collection(collection_id: str, body: CollectionUpdate, request:
             raise HTTPException(status_code=404, detail="Collection not found")
         sets = []
         params = {"id": collection_id}
-        for field in ("name", "type", "is_series", "cover_path", "description"):
+        for field in ("name", "type", "is_series", "cover_path", "description", "private"):
             val = getattr(body, field)
             if val is not None:
                 sets.append(f"c.{field} = ${field}")
@@ -219,14 +229,14 @@ async def update_collection(collection_id: str, body: CollectionUpdate, request:
 
 
 @router.get("/collections/{collection_id}/items")
-async def get_collection_items(collection_id: str):
+async def get_collection_items(collection_id: str, request: Request):
     async with get_session() as session:
         result = await session.run(
-            "MATCH (c:Collection {id: $id}) RETURN c.is_series AS is_series",
+            "MATCH (c:Collection {id: $id}) RETURN c.is_series AS is_series, coalesce(c.private, false) AS private",
             id=collection_id,
         )
         rec = await result.single()
-        if not rec:
+        if not rec or (rec["private"] and not is_admin_request(request)):
             raise HTTPException(status_code=404, detail="Collection not found")
         is_series = rec["is_series"]
 
