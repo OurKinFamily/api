@@ -15,7 +15,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from app.deps import current_email, is_admin_email
+from app.deps import can_see_gallery, current_email, is_admin_email
 
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
@@ -24,6 +24,10 @@ WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 # (the `/api` prefix is stripped before it reaches here). Keep this list tiny and
 # obviously-read-only.
 READ_ONLY_WRITE_PATHS = {"/search", "/api/search"}
+
+# Write endpoints open to anyone in GALLERY_EMAILS, not just the owner —
+# uploading photos is a gallery-tier privilege. Prefix-matched (job id follows).
+GALLERY_WRITE_PREFIXES = ("/gallery/upload", "/api/gallery/upload")
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -37,6 +41,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
             and request.url.path not in READ_ONLY_WRITE_PATHS
             and not is_admin_email(email)
         ):
+            # Gallery users may upload, even though the rest of the write API is
+            # owner-only.
+            path = request.url.path
+            if any(path.startswith(pfx) for pfx in GALLERY_WRITE_PREFIXES) and can_see_gallery(email):
+                return await call_next(request)
             return JSONResponse(
                 status_code=403,
                 content={"detail": "This archive is read-only for you — only the owner can make changes."},
