@@ -4,10 +4,13 @@ from fastapi import HTTPException, Request
 
 CF_EMAIL_HEADER = "cf-access-authenticated-user-email"
 ADMIN_EMAILS = frozenset({"stephenyoung7267@gmail.com"})
-# Who may see the full photo Gallery (and Search/Albums/Favorites). Broader than
-# admin: the owner + Cayce. Everyone else gets the curated family experience
+# Who may see the full photo Gallery and Places. Broader than admin: the owner,
+# Cayce, and Deborah Sturtevant. Everyone else gets the curated family experience
 # (People, Biographies, Scrapbook, Family tree) without the firehose gallery.
-GALLERY_EMAILS = ADMIN_EMAILS | frozenset({"caycewardyoung@gmail.com"})
+GALLERY_EMAILS = ADMIN_EMAILS | frozenset({
+    "caycewardyoung@gmail.com",
+    "d.sturtevant@outlook.com",
+})
 
 
 def current_email(request: Request) -> str | None:
