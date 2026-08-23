@@ -10,11 +10,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+import asyncio
+
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, field_validator
 from app.config import settings, with_v
 from app.db.neo4j import get_session
 from app.log import logger
+from app.services import upload as upload_svc
 
 router = APIRouter(prefix="/gallery", tags=["gallery"])
 
@@ -60,6 +63,9 @@ async def list_media(
     # grid. Face-crop thumbnails (__faces) are internal artifacts, never items.
     conditions.append("NOT p:Document")
     conditions.append("NOT p.path CONTAINS '__faces'")
+    # Phone uploads sent to "staging" get a node but stay out of the grid until
+    # a future promote step flips the flag.
+    conditions.append("(p.staged IS NULL OR p.staged = false)")
 
     if undated:
         # The "0000" / no-date bucket — scanned albums and the like with no
@@ -167,6 +173,45 @@ async def list_media(
         "offset":   offset,
         "has_more": offset + limit < total,
     }
+
+
+@router.post("/upload", status_code=202)
+async def upload_media(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    destination: str = Form("staging"),
+):
+    """Accept N phone photos/videos, kick off background mpp processing, return a
+    job id to poll. `destination` = "gallery" (into archive/, shows in the grid)
+    or "staging" (parked out of the grid for later review). Open to the gallery
+    tier — see the auth middleware's gallery-write exception."""
+    if destination not in ("gallery", "staging"):
+        raise HTTPException(422, "destination must be 'gallery' or 'staging'")
+    if not files:
+        raise HTTPException(422, "no files uploaded")
+
+    email = getattr(request.state, "user_email", None)
+    job = await upload_svc.create_job(files, destination, email)
+    asyncio.create_task(upload_svc.process_job(job["id"]))
+
+    logger.bind(
+        event="media.upload_started",
+        job_id=job["id"],
+        count=len(job["files"]),
+        destination=destination,
+        by=email,
+        request_id=getattr(request.state, "request_id", None),
+    ).info("media upload started")
+    return upload_svc.public_job(job)
+
+
+@router.get("/upload/{job_id}")
+async def upload_status(job_id: str):
+    """Poll a running/finished upload job for per-file status + readiness."""
+    job = upload_svc.load_job(job_id)
+    if not job:
+        raise HTTPException(404, "upload job not found")
+    return upload_svc.public_job(job)
 
 
 class RedateBody(BaseModel):
