@@ -1,3 +1,4 @@
+import math
 import re
 import uuid
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -669,20 +670,70 @@ def _format_age(age_years: float) -> str:
     return f"age {int(age_years)}"
 
 
-# Bucket definitions: (low_inclusive, high_inclusive, label)
-_LIFE_BUCKETS = [
-    (0,  1,  "baby"),
-    (2,  4,  "toddler"),
-    (5,  9,  "kid"),
-    (10, 14, "preteen"),
-    (15, 19, "teen"),
-    (20, 29, "twenties"),
-    (30, 39, "thirties"),
-    (40, 49, "forties"),
-    (50, 59, "fifties"),
-    (60, 69, "sixties"),
-    (70, 999, "seventies+"),
-]
+# How many frames the strip aims for. The old ladder was a fixed set of named
+# brackets (baby / toddler / kid / ...), which meant an 8-year-old could only
+# ever fill three of them — Margaret had 15,180 photos rendered as 3 tiles.
+# Stride is derived instead, so the strip stays about this long at any age.
+_TARGET_TILES = 12
+
+# Bucket key looks like "y5" (a single year) or "y4-7" (a stride of four).
+_AGE_BUCKET_RE = re.compile(r"^y(\d+)(?:-(\d+))?$")
+
+
+def _life_buckets_for(lo_age: int, hi_age: int):
+    """(low, high, label) whole-year buckets covering lo_age..hi_age, strided
+    so the result lands near _TARGET_TILES.
+
+    Bounds are whole years and `high` is inclusive of that year, so a bucket
+    (2, 2) means "age two" and matches a photo at age 2.4 — callers compare with
+    `lo <= age < hi + 1`, since ages are fractional.
+
+    Under ten that works out to one bucket per year; a twenty-year-old gets
+    two-year strides, a forty-year-old four. Bounds come from the ages actually
+    photographed rather than from the person's current age — someone whose
+    pictures stop at five should get a dense strip of those five years, not ten
+    empty brackets covering a life the archive has nothing from.
+    """
+    lo_age = max(0, int(lo_age))
+    hi_age = max(lo_age, int(hi_age))
+    span = hi_age - lo_age + 1
+    step = max(1, math.ceil(span / _TARGET_TILES))
+    out = []
+    for lo in range(lo_age, hi_age + 1, step):
+        hi = lo + step - 1
+        out.append((lo, hi, f"y{lo}" if step == 1 else f"y{lo}-{hi}"))
+    return out
+
+
+def _resolve_locks(locked_by_label, stills, buckets):
+    """Re-key locks onto the current buckets via the AGE OF THE PHOTO each one
+    points at, rather than the label it was saved under.
+
+    Bucket labels are not stable: the stride widens as a person ages, and these
+    replaced the old named brackets outright. Matching on the stored label would
+    silently orphan every existing lock (Margaret's 'toddler' and 'kid' among
+    them) the moment the boundaries moved.
+    """
+    age_by_path = {p["path"]: p["age_years"] for p in stills}
+    out = {}
+    for path in locked_by_label.values():
+        age = age_by_path.get(path)
+        if age is None:
+            continue  # locked photo no longer in the pool
+        for lo, hi, label in buckets:
+            if lo <= age < hi + 1:
+                out.setdefault(label, path)
+                break
+    return out
+
+
+def _bucket_bounds(label):
+    """Parse a bucket key back into (lo, hi). None if it isn't an age bucket."""
+    m = _AGE_BUCKET_RE.match(label)
+    if not m:
+        return None
+    lo = int(m.group(1))
+    return lo, int(m.group(2)) if m.group(2) else lo
 
 # Decade bucket label for the no-birth-date fallback strip, e.g. 1994 -> "1990s".
 _DECADE_RE = re.compile(r"^(\d{4})s$")
@@ -975,13 +1026,16 @@ async def life_stages(person_id: str):
 
     out = []
     if birth_dt is not None:
-        # Age buckets: baby → seventies+.
-        for lo, hi, label in _LIFE_BUCKETS:
-            in_bucket = [p for p in stills if lo <= p["age_years"] <= hi]
+        # Age buckets, strided to the range of ages actually photographed.
+        ages = [p["age_years"] for p in stills]
+        buckets = _life_buckets_for(min(ages), max(ages))
+        locks = _resolve_locks(locked_by_bucket, stills, buckets)
+        for lo, hi, label in buckets:
+            in_bucket = [p for p in stills if lo <= p["age_years"] < hi + 1]
             if not in_bucket:
                 continue
             _sort_bucket(in_bucket)
-            chosen, locked = _pick_chosen(in_bucket, locked_by_bucket.get(label))
+            chosen, locked = _pick_chosen(in_bucket, locks.get(label))
             out.append(_life_stage_tile(label, chosen, chosen["age_years"], len(in_bucket), locked))
     else:
         # No birth date → fall back to a chronological "through the years"
@@ -1003,11 +1057,11 @@ async def life_stage_candidates(person_id: str, bucket: str, limit: int = 24):
         return {"candidates": []}
 
     if birth_dt is not None:
-        bracket = next((b for b in _LIFE_BUCKETS if b[2] == bucket), None)
-        if bracket is None:
+        bounds = _bucket_bounds(bucket)
+        if bounds is None:
             raise HTTPException(404, f"Unknown bucket {bucket!r}")
-        lo, hi, _ = bracket
-        in_bucket = [p for p in stills if lo <= p["age_years"] <= hi]
+        lo, hi = bounds
+        in_bucket = [p for p in stills if lo <= p["age_years"] < hi + 1]
         _sort_bucket(in_bucket)
         out = [
             _life_stage_tile(bucket, p, p["age_years"], len(in_bucket), False)
@@ -1027,6 +1081,26 @@ async def life_stage_candidates(person_id: str, bucket: str, limit: int = 24):
         for p in in_bucket[:limit]
     ]
     return {"candidates": out}
+
+
+async def _stale_lock_paths(session, person_id, bucket):
+    """Paths of this person's stills whose age falls inside `bucket`.
+
+    A lock saved under an older label ("toddler", or a narrower stride from
+    before a birthday) covers the same stretch of life as the bucket the user is
+    acting on now. Deleting only by label would leave that edge in place, and
+    since reads resolve locks by photo age it would immediately reappear as a
+    lock the user just tried to remove.
+    """
+    bounds = _bucket_bounds(bucket)
+    if bounds is None:
+        return []
+    lo, hi = bounds
+    _birth, stills, _locks = await _fetch_life_stage_pool(session, person_id)
+    return [
+        p["path"] for p in stills
+        if p["age_years"] is not None and lo <= p["age_years"] < hi + 1
+    ]
 
 
 class LifeStageLockBody(BaseModel):
@@ -1050,16 +1124,18 @@ async def lock_life_stage(person_id: str, body: LifeStageLockBody, request: Requ
         row = await check.single()
         if not row or row["n"] == 0:
             raise HTTPException(404, "Person doesn't appear in that media")
+        stale = await _stale_lock_paths(session, person_id, body.bucket)
         await session.run(
             """
             MATCH (p:Person {id: $pid})
-            OPTIONAL MATCH (p)-[old:LIFE_STAGE {bucket: $bucket}]->()
+            OPTIONAL MATCH (p)-[old:LIFE_STAGE]->(om:Media)
+              WHERE old.bucket = $bucket OR om.path IN $stale
             DELETE old
-            WITH p
+            WITH DISTINCT p
             MATCH (m:Media {path: $path})
             MERGE (p)-[:LIFE_STAGE {bucket: $bucket}]->(m)
             """,
-            pid=person_id, bucket=body.bucket, path=body.path,
+            pid=person_id, bucket=body.bucket, path=body.path, stale=stale,
         )
     logger.bind(
         event="life_stage.locked",
@@ -1073,12 +1149,14 @@ async def lock_life_stage(person_id: str, body: LifeStageLockBody, request: Requ
 async def unlock_life_stage(person_id: str, bucket: str, request: Request):
     """Drop the lock on a bucket so it goes back to auto-pick."""
     async with get_session() as session:
+        stale = await _stale_lock_paths(session, person_id, bucket)
         await session.run(
             """
-            MATCH (p:Person {id: $pid})-[ls:LIFE_STAGE {bucket: $bucket}]->()
+            MATCH (p:Person {id: $pid})-[ls:LIFE_STAGE]->(m:Media)
+            WHERE ls.bucket = $bucket OR m.path IN $stale
             DELETE ls
             """,
-            pid=person_id, bucket=bucket,
+            pid=person_id, bucket=bucket, stale=stale,
         )
     logger.bind(
         event="life_stage.unlocked",
