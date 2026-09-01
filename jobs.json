@@ -59,7 +59,7 @@
     "name": "Face Clustering",
     "description": "Run DBSCAN on .faces.json embeddings, write clusters.json, auto-assign to known people",
     "color": "#6366f1",
-    "whenToRun": "STEP 3 of the face pipeline. Run after Face Detection if you want new faces to surface on /manage/faces/unassigned. Groups all face embeddings into clusters (Stephen's faces in one bucket, Patty's in another, etc.). Without this, new faces are detected but never appear as something you can label. Safe to re-run — assigned + skipped faces are tracked in Neo4j separately and get filtered out automatically, so re-clustering won't lose work. ~1 minute.",
+    "whenToRun": "STEP 3 of the face pipeline. Run after Face Detection if you want new faces to surface on /manage/faces/unassigned. Groups all face embeddings into clusters (Stephen's faces in one bucket, Patty's in another, etc.). Without this, new faces are detected but never appear as something you can label. Safe to re-run \u2014 assigned + skipped faces are tracked in Neo4j separately and get filtered out automatically, so re-clustering won't lose work. ~1 minute.",
     "shell_command": "cd /home/stephen/Documents/ourkin/workshop/services/face-recognition && source venv/bin/activate && python cluster_faces.py --eps {eps} --min-samples {min_samples} --threshold {threshold} {auto_assign}",
     "params": [
       {
@@ -67,7 +67,7 @@
         "label": "DBSCAN eps",
         "type": "text",
         "default": "0.3",
-        "hint": "Max cosine distance within a cluster (0.0–1.0). Lower = stricter / smaller / purer clusters. 0.3 is current production setting; try 0.27 if mega-clusters merge multiple people."
+        "hint": "Max cosine distance within a cluster (0.0\u20131.0). Lower = stricter / smaller / purer clusters. 0.3 is current production setting; try 0.27 if mega-clusters merge multiple people."
       },
       {
         "name": "min_samples",
@@ -83,15 +83,18 @@
         "flag": "--skip-assign",
         "invert": true,
         "default": false,
-        "hint": "Check to run auto_assign after clustering — assigns clusters to known people based on face_gallery overlap. Off by default to avoid touching assignments.json when re-tuning eps."
+        "hint": "Check to run auto_assign after clustering \u2014 assigns clusters to known people based on face_gallery overlap. Off by default to avoid touching assignments.json when re-tuning eps."
       },
       {
         "name": "threshold",
         "label": "Auto-assign threshold",
         "type": "text",
         "default": "0.85",
-        "show_if": { "name": "auto_assign", "equals": true },
-        "hint": "Fraction of a cluster that must match a known person's face_gallery for auto-assign. 0.0–1.0 (0.85 = 85%). Higher = stricter (fewer false matches, fewer auto-assigns). Lower = more aggressive."
+        "show_if": {
+          "name": "auto_assign",
+          "equals": true
+        },
+        "hint": "Fraction of a cluster that must match a known person's face_gallery for auto-assign. 0.0\u20131.0 (0.85 = 85%). Higher = stricter (fewer false matches, fewer auto-assigns). Lower = more aggressive."
       }
     ]
   },
@@ -100,16 +103,34 @@
     "name": "Build Face Index",
     "description": "Read all .faces.json sidecars, write embeddings.npy + faces_meta.json for similarity search",
     "color": "#a78bfa",
-    "whenToRun": "STEP 2 of the face pipeline. Run after Face Detection if you want the new faces searchable. Collects all face embeddings from every sidecar into one big embeddings.npy file — used by /manage/faces/similar (the 'find matches for this person' workflow). Without this, similarity search won't see the newly-detected faces. Rebuilds the whole index every time (~few minutes on the full archive). Skip unless you actually need similarity search to be current.",
+    "whenToRun": "STEP 2 of the face pipeline. Run after Face Detection if you want the new faces searchable. Collects all face embeddings from every sidecar into one big embeddings.npy file \u2014 used by /manage/faces/similar (the 'find matches for this person' workflow). Without this, similarity search won't see the newly-detected faces. Rebuilds the whole index every time (~few minutes on the full archive). Skip unless you actually need similarity search to be current.",
     "shell_command": "cd /home/stephen/Documents/ourkin/workshop/services/face-recognition && source venv/bin/activate && python build_embedding_index.py",
     "params": []
+  },
+  {
+    "id": "faces-count-backfill",
+    "name": "Backfill Face Count",
+    "description": "Copy num_faces from .faces.json sidecars onto :Media nodes",
+    "color": "#a78bfa",
+    "whenToRun": "STEP 4 of the face pipeline, after Face Detection. Detection records how many faces it found in the .faces.json sidecar on disk, but the app reads Neo4j, so the :Media node never learns the number. This copies it onto the node as face_count. Without it the gallery's 'unassigned faces' filter \u2014 a Cypher query \u2014 reports nothing, even though the faces are sitting in the sidecars. Idempotent; safe to re-run any time. Cheap enough to run after every detection pass.",
+    "shell_command": "cd /home/stephen/Documents/ourkin/workshop && source venv/bin/activate && python services/media-archiver/backfill_face_count.py {execute}",
+    "params": [
+      {
+        "name": "execute",
+        "label": "Write changes",
+        "type": "flag",
+        "flag": "--execute",
+        "default": true,
+        "hint": "Off = dry run: counts what would change without writing."
+      }
+    ]
   },
   {
     "id": "objects-detect",
     "name": "Object Detection",
     "description": "Run YOLO on archive (images + videos), write .objects.json sidecars",
     "color": "#f59e0b",
-    "whenToRun": "Run after dropping new photos/videos into /photos/archive. Writes a .objects.json sidecar listing every detected object (people, animals, vehicles, etc.) with bounding boxes. Independent of the face pipeline — no need to run before/after. Narrow the path for incremental runs.",
+    "whenToRun": "Run after dropping new photos/videos into /photos/archive. Writes a .objects.json sidecar listing every detected object (people, animals, vehicles, etc.) with bounding boxes. Independent of the face pipeline \u2014 no need to run before/after. Narrow the path for incremental runs.",
     "shell_command": "cd /home/stephen/Documents/ourkin/workshop/services/object-detection && source venv/bin/activate && python detect_objects.py {path} {recursive} {force} --model {model} --confidence {confidence} --frames {frames}",
     "params": [
       {
@@ -164,7 +185,7 @@
     "name": "CLIP Embeddings",
     "description": "Extract CLIP semantic embeddings, write .clip.json sidecars",
     "color": "#06b6d4",
-    "whenToRun": "Run after dropping new photos into /photos/archive. Writes a .clip.json sidecar with a semantic embedding per image — used for natural-language search (\"dog at beach\", \"birthday cake\"). Independent of the face / object pipelines. Narrow the path for incremental runs.",
+    "whenToRun": "Run after dropping new photos into /photos/archive. Writes a .clip.json sidecar with a semantic embedding per image \u2014 used for natural-language search (\"dog at beach\", \"birthday cake\"). Independent of the face / object pipelines. Narrow the path for incremental runs.",
     "shell_command": "cd /home/stephen/Documents/ourkin/workshop/services/content-understanding && source venv/bin/activate && python extract_clip.py {path} {recursive} {force} --model {model}",
     "params": [
       {
@@ -205,7 +226,7 @@
     "name": "Scene Embeddings",
     "description": "Extract DINOv2 scene embeddings, write .scenes.json sidecars",
     "color": "#10b981",
-    "whenToRun": "Run after dropping new photos into /photos/archive. Writes a .scenes.json sidecar with a DINOv2 scene embedding — used for visual-similarity search (\"more photos that LOOK like this one\", regardless of subject). Independent of other pipelines. Narrow the path for incremental runs.",
+    "whenToRun": "Run after dropping new photos into /photos/archive. Writes a .scenes.json sidecar with a DINOv2 scene embedding \u2014 used for visual-similarity search (\"more photos that LOOK like this one\", regardless of subject). Independent of other pipelines. Narrow the path for incremental runs.",
     "shell_command": "cd /home/stephen/Documents/ourkin/workshop/services/scene-recognition && source venv/bin/activate && python extract_scenes.py {path} {recursive} {force} --model {model}",
     "params": [
       {
@@ -246,7 +267,7 @@
     "name": "Archive Report",
     "description": "Scan archive metadata and regenerate report.json for Admin Overview",
     "color": "#64748b",
-    "whenToRun": "Run when the /admin/overview page numbers look stale — e.g. after a big import or after any of the extractor jobs above finish. Scans every file's metadata and recounts coverage stats. ~couple minutes. Safe to run any time.",
+    "whenToRun": "Run when the /admin/overview page numbers look stale \u2014 e.g. after a big import or after any of the extractor jobs above finish. Scans every file's metadata and recounts coverage stats. ~couple minutes. Safe to run any time.",
     "shell_command": "cd /home/stephen/Documents/ourkin/workshop && python3 mm/mm.py report {path} {summary} {verbose} -o {output}",
     "params": [
       {
@@ -269,7 +290,7 @@
         "type": "flag",
         "flag": "-s",
         "default": false,
-        "hint": "Only print summary tables — skip per-file lists."
+        "hint": "Only print summary tables \u2014 skip per-file lists."
       },
       {
         "name": "verbose",

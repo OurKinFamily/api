@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+
+from app.config import settings
 from fastapi.responses import JSONResponse
 
 from app.deps import require_admin
@@ -34,6 +36,27 @@ except PermissionError:
     pass
 
 active_processes: dict[str, subprocess.Popen] = {}
+
+
+def _job_env() -> dict:
+    """Environment for a job subprocess.
+
+    Jobs inherit the API process environment, but pydantic-settings reads .env
+    into the Settings object rather than into os.environ — so a child process
+    sees no NEO4J_* at all and any job touching the graph dies with
+    "NEO4J_PASSWORD not set". Pass them explicitly.
+
+    Injected, never written into jobs.json: a credential in a tracked file
+    caused the 2026-06-02 incident that needed a history rewrite.
+    """
+    return {
+        **os.environ,
+        "NEO4J_URI": settings.neo4j_uri,
+        "NEO4J_USER": settings.neo4j_user,
+        "NEO4J_PASSWORD": settings.neo4j_password,
+    }
+
+
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -114,6 +137,7 @@ def _run_job(run_id: str, cmd: str, log_path: Path):
             proc = subprocess.Popen(
                 cmd, shell=True, stdout=lf, stderr=subprocess.STDOUT,
                 executable="/bin/bash", preexec_fn=os.setsid,
+                env=_job_env(),
             )
             active_processes[run_id] = proc
             run = load_run(run_id)
