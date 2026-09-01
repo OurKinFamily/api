@@ -161,10 +161,17 @@ async def list_media(
             "confidence":     p.get("timestamp_confidence"),
             "dominant_color": p.get("dominant_color"),
             "is_video":       p.get("is_video", False),
+            # Seconds. Lets a video tile show its length without the client
+            # having to fetch the file to find out.
+            "duration":       p.get("duration"),
             "width":          p.get("width"),
             "height":         p.get("height"),
             "place_name":     p.get("place_name"),
-            "city":           p.get("city"),
+            # The importer and the location PATCH endpoint both write
+            # location_city; reading "city" meant the gallery never showed a
+            # place, despite 155k photos carrying a reverse-geocoded one.
+            "city":           p.get("location_city") or p.get("city"),
+            "state":          p.get("location_state"),
         })
 
     return {
