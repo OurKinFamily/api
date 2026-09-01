@@ -740,8 +740,18 @@ async def media_detail(path: str = Query(...)):
             face_count = fd.get("num_faces")
             bbox_by_index = {f["face_index"]: f.get("bbox") for f in fd.get("faces", [])}
             for p in people:
-                p["bbox"]     = bbox_by_index.get(p.get("face_index"))
-                p["crop_url"] = with_v(f"/api/media/{p['crop_path']}") if p.get("crop_path") else None
+                p["bbox"] = bbox_by_index.get(p.get("face_index"))
+                # Only hand back a crop URL if the crop is actually on disk.
+                # ~0.4% of APPEARS_IN edges carry a crop_path whose file has
+                # since gone, and an assigned face used to get a URL regardless
+                # — 404ing in the lightbox. Unassigned faces below already
+                # checked; this makes the two consistent.
+                cp = p.get("crop_path")
+                p["crop_url"] = (
+                    with_v(f"/api/media/{cp}")
+                    if cp and (settings.photos_root / cp).exists()
+                    else None
+                )
 
             # Faces not yet assigned to anyone. Use the crop_path the worker
             # recorded in the sidecar — it stores crops by the photo's date,
