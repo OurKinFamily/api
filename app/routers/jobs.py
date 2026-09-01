@@ -71,6 +71,17 @@ def _jobs_by_id() -> dict:
     return {j["id"]: j for j in load_jobs()}
 
 
+def exit_file(run_id: str) -> Path:
+    """Where the job records its own exit code.
+
+    The parent's proc.wait() is not enough: if the API restarts (a --reload in
+    dev, a deploy in prod) the waiting thread dies with it and the exit code is
+    gone, leaving a finished run stuck at "running" forever. Having the shell
+    write it means the truth outlives the process that started the job.
+    """
+    return RUNS_DIR / f"{run_id}.exit"
+
+
 def load_run(run_id: str) -> dict | None:
     path = RUNS_DIR / f"{run_id}.json"
     return json.loads(path.read_text()) if path.exists() else None
@@ -124,18 +135,43 @@ def get_last_log_line(log_path: str) -> str:
     return ""
 
 
+
+def _status_for(exit_code) -> str:
+    """exit 0 = clean, 2 = finished with per-file warnings, -15 = cancelled."""
+    if exit_code is None:
+        return "unknown"
+    return (
+        "completed" if exit_code == 0
+        else "completed_with_warnings" if exit_code == 2
+        else "cancelled" if exit_code in (-15, 143)
+        else "failed"
+    )
+
+
+def _recover_exit_code(run_id: str):
+    """The exit code a finished job wrote for itself, if it got that far."""
+    try:
+        return int(exit_file(run_id).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def _run_job(run_id: str, cmd: str, log_path: Path):
     run = load_run(run_id)
     run["status"]     = "running"
     run["started_at"] = datetime.now().isoformat(timespec="seconds")
     save_run(run)
 
+    # Record the exit code from inside the shell so it survives the API process
+    # going away mid-job (a --reload in dev, a deploy in prod).
+    wrapped = f'{cmd}\nrc=$?\nprintf %s "$rc" > {exit_file(run_id)}\nexit $rc'
+
     with open(log_path, "w") as lf:
         lf.write(f"$ {cmd}\n\n")
         lf.flush()
         try:
             proc = subprocess.Popen(
-                cmd, shell=True, stdout=lf, stderr=subprocess.STDOUT,
+                wrapped, shell=True, stdout=lf, stderr=subprocess.STDOUT,
                 executable="/bin/bash", preexec_fn=os.setsid,
                 env=_job_env(),
             )
@@ -151,17 +187,11 @@ def _run_job(run_id: str, cmd: str, log_path: Path):
 
     active_processes.pop(run_id, None)
     run = load_run(run_id)
-    # exit 0 = clean, 2 = finished but some files errored (warnings), -15 = SIGTERM
-    # (cancelled), anything else = real failure.
-    run["status"] = (
-        "completed" if exit_code == 0
-        else "completed_with_warnings" if exit_code == 2
-        else "cancelled" if exit_code == -15
-        else "failed"
-    )
+    run["status"] = _status_for(exit_code)
     run["exit_code"]   = exit_code
     run["finished_at"] = datetime.now().isoformat(timespec="seconds")
     save_run(run)
+    exit_file(run_id).unlink(missing_ok=True)
 
 
 def _annotate_runs(runs: list) -> list:
