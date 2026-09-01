@@ -1167,6 +1167,44 @@ async def people_samples(person_id: str, limit: int = 48):
 
 # ── Face cluster summary ─────────────────────────────────────────────────
 
+@router.get("/analytics/scenes/summary")
+async def scenes_summary():
+    """DINOv2 scene-embedding stats, read from the generated archive report.
+
+    Deliberately not a live scan: there is one .scenes.json per image (~25 KB of
+    float each), so walking them per request would take minutes. The Archive
+    Report job already visits every sidecar, so it does the counting and this
+    just serves the result.
+
+    `mixed_models` is the one worth acting on -- embeddings from different DINOv2
+    variants live in different vector spaces and different dimensions, so a mixed
+    archive cannot be compared end to end.
+    """
+    if not REPORT_PATH.exists():
+        return {"available": False, "reason": "report.json not found — run the Archive Report job"}
+    import json
+    try:
+        report = json.loads(REPORT_PATH.read_text())
+    except Exception as e:
+        raise HTTPException(500, f"failed to read report.json: {e}")
+    scenes = report.get("scenes")
+    if not scenes:
+        return {"available": False, "reason": "report predates scene stats — re-run the Archive Report job"}
+    return {
+        "available": True,
+        "generated": report.get("generated"),
+        "total":     scenes.get("total", 0),
+        "images":    scenes.get("images", 0),
+        "videos":    scenes.get("videos", 0),
+        "eligible":  scenes.get("eligible", 0),
+        "pct":       scenes.get("pct"),
+        "missing":   report.get("issues", {}).get("missing_scenes"),
+        "mixed_models": scenes.get("mixed_models", False),
+        "models": [{"name": k, "count": v} for k, v in (scenes.get("models") or {}).items()],
+        "dims":   [{"dim": k, "count": v} for k, v in (scenes.get("dims") or {}).items()],
+    }
+
+
 @router.get("/analytics/face_clusters/summary")
 async def face_clusters_summary():
     """Stats from the face cluster sidecars: total clusters, total faces,
