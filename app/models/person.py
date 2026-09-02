@@ -40,6 +40,9 @@ class Person(BaseModel):
     avatar: Optional[str] = None
     cover_image: Optional[str] = None
     cover_position: Optional[str] = None  # 'fit' (default) | 'top' | 'center' | 'bottom'
+    # How many media items this person appears in. Already counted to order the
+    # list; returning it saves the client asking 523 separate questions.
+    photo_count: Optional[int] = None
     email: Optional[str] = None
     biography: Optional[str] = None  # freeform markdown; inline ![caption](path) images float alongside the text
     bio_private: bool = False  # when true, the biography is hidden from non-admin family viewers

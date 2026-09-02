@@ -90,11 +90,17 @@ async def list_people(request: Request, viewer_id: str | None = None):
                 MATCH (p:Person)
                 OPTIONAL MATCH (p)-[:APPEARS_IN]->(m:Media)
                 WITH p, count(m) AS photo_count
-                RETURN p ORDER BY photo_count DESC, p.name
+                RETURN p, photo_count ORDER BY photo_count DESC, p.name
                 """
             )
         records = await result.data()
-        return [Person(**r["p"]) for r in records]
+        # photo_count is counted to order the list either way; returning it
+        # saves the client asking 523 separate questions to show a number it
+        # already knows.
+        return [
+            Person(**{**r["p"], "photo_count": r.get("photo_count")})
+            for r in records
+        ]
 
 
 @router.get("/with-biography")
