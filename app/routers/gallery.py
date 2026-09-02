@@ -41,7 +41,7 @@ CONFIDENCE_SETS = {
 def build_media_filters(
     *, min_confidence="high", year_from=None, year_to=None, ts_from=None, ts_to=None,
     media_type="all", person_ids=None, undated=False, gps="both",
-    camera_model=None, unassigned_faces=False,
+    camera_model=None, unassigned_faces=False, favorited_by=None,
 ):
     """The gallery's WHERE clause, shared by every endpoint that lists media.
 
@@ -103,6 +103,16 @@ def build_media_filters(
             "size(coalesce(p.skipped_faces, [])) + "
             "COUNT { (p)<-[r:APPEARS_IN]-(:Person) WHERE r.face_index IS NOT NULL }"
         )
+    # Favourites, as a filter rather than a separate endpoint. The Favourites
+    # page is the gallery with one more condition — same grid, same counts,
+    # same scrubber — and going through the shared builder is what guarantees
+    # the item shape and the counts cannot drift from it.
+    if favorited_by:
+        conditions.append(
+            "EXISTS { (:Person {id: $fav_uid})-[:FAVORITED]->(p) }"
+        )
+        params["fav_uid"] = favorited_by
+
     ids = [i.strip() for i in person_ids.split(",") if i.strip()] if person_ids else []
     if ids:
         conditions.append("ALL(pid IN $person_ids WHERE EXISTS { (:Person {id: pid})-[:APPEARS_IN]->(p) })")
@@ -113,6 +123,13 @@ def build_media_filters(
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     return "MATCH (p:Media)", where, params
+
+
+async def _favoriting_person(request: Request) -> str:
+    """Whose favourites. Reuses the same identity the favourites endpoints
+    use, so the page and the heart on a tile always mean the same person."""
+    from app.routers.me import _require_user_id
+    return await _require_user_id(request)
 
 
 @router.get("")
@@ -131,8 +148,12 @@ async def list_media(
     gps:            str           = Query(default="both"),     # has | none | both — GPS coordinates present?
     camera_model:   Optional[str] = Query(default=None),       # exact camera_model match
     unassigned_faces: bool        = Query(default=False),      # only media with detected-but-unassigned faces
+    favorites:      bool          = Query(default=False),      # only the signed-in person's favourites
+    request:        Request       = None,
 ):
+    favorited_by = await _favoriting_person(request) if favorites else None
     match, where, filter_params = build_media_filters(
+        favorited_by=favorited_by,
         min_confidence=min_confidence, year_from=year_from, year_to=year_to,
         ts_from=ts_from, ts_to=ts_to, media_type=media_type,
         person_ids=person_ids, undated=undated, gps=gps,
@@ -213,6 +234,8 @@ async def media_counts(
     person_ids:     Optional[str] = Query(default=None),
     gps:            str           = Query(default="both"),
     camera_model:   Optional[str] = Query(default=None),
+    favorites:      bool          = Query(default=False),
+    request:        Request       = None,
 ):
     """How many media items fall in each date bucket, newest first.
 
@@ -234,6 +257,7 @@ async def media_counts(
     width = 7 if bucket == "month" else 10
 
     match, where, params = build_media_filters(
+        favorited_by=await _favoriting_person(request) if favorites else None,
         min_confidence=min_confidence, media_type=media_type,
         person_ids=person_ids, gps=gps, camera_model=camera_model,
     )
