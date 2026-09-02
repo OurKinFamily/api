@@ -1159,6 +1159,16 @@ async def media_detail(path: str = Query(...)):
     # of what an archive is for, so it belongs in the payload whether or not a
     # sidecar exists.
     base["description"] = None
+    # A photograph that has been restored keeps what it looked like before,
+    # under originals/ mirroring the archive's shape. Offering it here is what
+    # lets the viewer show the before — and it is the only record that the
+    # picture on screen is partly a machine's work.
+    original_rel = f"originals/{path.removeprefix('archive/')}"
+    base["original_url"] = (
+        with_v(f"/api/media/{original_rel}")
+        if (settings.photos_root / original_rel).is_file()
+        else None
+    )
 
     # Query Neo4j for people (with face_index + crop_path from relationship)
     # and the Media node itself (for heritage fields).
