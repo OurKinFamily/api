@@ -976,6 +976,57 @@ async def restore_apply(request: Request, path: str = Query(...)):
     return result
 
 
+@router.post("/media/tone")
+async def adjust_tone(
+    request: Request,
+    path: str = Query(...),
+    shadows: int = Query(0, ge=-100, le=100),
+    midtones: int = Query(0, ge=-100, le=100),
+    highlights: int = Query(0, ge=-100, le=100),
+):
+    """Lift or lower the dark, middle and bright parts of a photograph.
+
+    Arithmetic, not a model: it does exactly what it is told, which is the
+    point. A flat scan can be opened up without anything being invented.
+
+    The photograph as it was is kept under originals/, as a restoration is —
+    this re-encodes, so repeated goes compound the loss, and somebody who
+    overdoes it should get back to the scan rather than their last attempt.
+    """
+    from app.services.tone import apply_tone
+
+    try:
+        result = apply_tone(
+            settings.photos_root, path,
+            shadows=shadows, midtones=midtones, highlights=highlights,
+            thumbs_root=settings.photos_root / "__thumbs",
+            cache_roots=(Path("/tmp/thumbs"), Path("/tmp/medium")),
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except FileNotFoundError:
+        raise HTTPException(404, "Media not found")
+    except Exception as e:
+        log.warning(f"tone failed for {path!r}: {e}")
+        raise HTTPException(500, f"could not adjust: {e}")
+
+    async with get_session() as session:
+        await session.run(
+            "MATCH (m:Media {path: $path}) SET m.media_version = $v",
+            path=path, v=result["version"],
+        )
+
+    logger.bind(
+        event="media.toned", path=path,
+        shadows=shadows, midtones=midtones, highlights=highlights,
+        original=result["original"],
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("tone adjusted")
+
+    return result
+
+
 @router.post("/media/crop")
 async def crop_media_endpoint(
     request: Request,
