@@ -159,6 +159,30 @@ def _clear_orientation(exif_bytes: bytes) -> bytes:
         return exif_bytes
 
 
+def clear_derived_caches(rel_path: str, thumbs_root=None, cache_roots=None) -> bool:
+    """Drop every rendition of a photograph. Returns whether any existed.
+
+    They are all regenerated on demand, so deleting is the whole fix. Missing
+    one is worse than it sounds: the grid went on showing the old thumbnail
+    after a rotate, and a reader with no reason to open the photograph would
+    never have seen it change.
+
+    There are three caches, not one — the webp tree beside the archive, and two
+    on-demand caches under /tmp that the media routes fall back to. They share
+    a key: the path with "archive/" stripped, plus ".webp".
+    """
+    key = rel_path.removeprefix("archive/") + ".webp"
+    cleared = False
+    for root in (thumbs_root, *(cache_roots or ())):
+        if not root:
+            continue
+        cached = root / key
+        if cached.is_file():
+            cached.unlink(missing_ok=True)
+            cleared = True
+    return cleared
+
+
 def rotate_media(
     photos_root: Path,
     rel_path: str,
@@ -245,23 +269,7 @@ def rotate_media(
             pass
 
     # ── derived copies: stale the moment the pixels move ────────────────────
-    #
-    # Every one of these is regenerated on demand, so deleting is the whole
-    # fix. Missing one is worse than it sounds: the grid went on showing the
-    # old thumbnail after a rotate, and a reader with no reason to open the
-    # photograph would never have seen it turn.
-    #
-    # There are three caches, not one — the webp tree beside the archive, and
-    # two on-demand caches under /tmp that the media routes fall back to. They
-    # share a key: the path with "archive/" stripped, plus ".webp".
-    key = rel_path.removeprefix("archive/") + ".webp"
-    for root in (thumbs_root, *(cache_roots or ())):
-        if not root:
-            continue
-        cached = root / key
-        if cached.is_file():
-            cached.unlink(missing_ok=True)
-            touched["thumb"] = True
+    touched["thumb"] = clear_derived_caches(rel_path, thumbs_root, cache_roots)
 
     poster = Path(str(src) + ".poster.jpg")
     if poster.is_file():

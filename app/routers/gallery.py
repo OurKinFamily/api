@@ -767,6 +767,69 @@ async def rotate_media_endpoint(
     return result
 
 
+@router.post("/media/crop")
+async def crop_media_endpoint(
+    request: Request,
+    path: str = Query(...),
+    x: int = Query(..., ge=0, description="left edge, in displayed pixels"),
+    y: int = Query(..., ge=0, description="top edge, in displayed pixels"),
+    w: int = Query(..., gt=0, description="width, in displayed pixels"),
+    h: int = Query(..., gt=0, description="height, in displayed pixels"),
+):
+    """Crop a photograph, keeping the original.
+
+    Unlike rotation, this destroys pixels — so the uncropped file is copied to
+    `originals/pre-crop/<path>` before anything is written, and a crop can be
+    undone by putting it back. That is deliberately NOT the trash: a cropped
+    original has not been deleted, and emptying the trash must not destroy the
+    only full copy of something still in the archive.
+
+    The rectangle is in the coordinates of the photograph as DISPLAYED, which
+    is what the reader drew it on. Mapping it onto the stored pixels is the
+    service's problem — a portrait phone photograph is stored landscape, and
+    cropping "the top" without accounting for that takes a strip off the side.
+
+    JPEGs go through jpegtran, which cuts on the MCU grid and so rounds the
+    rectangle outward: the result can be a few pixels larger than asked. Face
+    boxes are moved by what actually happened rather than what was requested,
+    and faces left mostly outside the frame are dropped.
+    """
+    from app.services.crop import crop_media
+
+    try:
+        result = crop_media(
+            settings.photos_root, path, (x, y, w, h),
+            thumbs_root=settings.photos_root / "__thumbs",
+            cache_roots=(Path("/tmp/thumbs"), Path("/tmp/medium")),
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except FileNotFoundError:
+        raise HTTPException(404, "Media not found")
+    except Exception as e:
+        log.warning(f"crop failed for {path!r}: {e}")
+        raise HTTPException(500, f"could not crop: {e}")
+
+    async with get_session() as session:
+        await session.run(
+            "MATCH (m:Media {path: $path}) "
+            "SET m.width = $w, m.height = $h, m.media_version = $v",
+            path=path, w=result["width"], h=result["height"], v=result["version"],
+        )
+
+    logger.bind(
+        event="media.cropped",
+        path=path, rect=f"{w}x{h}+{x}+{y}",
+        lossless=result["lossless"],
+        faces_kept=result["faces_kept"], faces_dropped=result["faces_dropped"],
+        original=result["original"],
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("media cropped")
+
+    return result
+
+
 @router.delete("/media", status_code=204)
 async def delete_media(request: Request, path: str = Query(...)):
     """Soft-delete a Media node + its file + all sidecar siblings. The
