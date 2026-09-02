@@ -37,6 +37,84 @@ CONFIDENCE_SETS = {
 }
 
 
+
+def build_media_filters(
+    *, min_confidence="high", year_from=None, year_to=None, ts_from=None, ts_to=None,
+    media_type="all", person_ids=None, undated=False, gps="both",
+    camera_model=None, unassigned_faces=False,
+):
+    """The gallery's WHERE clause, shared by every endpoint that lists media.
+
+    Extracted so the counts endpoint cannot drift from the items endpoint. The
+    virtualised grid sizes itself from counts and then fetches items for a date
+    range; if the two disagree by even one photo, the layout reserves space that
+    never fills or drops photos that exist — the "hidden photos" failure again,
+    with a subtler cause.
+    """
+    conditions = []
+    params: dict = {}
+
+    # The gallery grid is photos + videos only. Scrapbook / yearbook / journal
+    # PAGES are :Document nodes — they belong in Collections (the collection
+    # card shows in Scrapbook), not as ~3,400 individual tiles flooding the
+    # grid. Face-crop thumbnails (__faces) are internal artifacts, never items.
+    conditions.append("NOT p:Document")
+    conditions.append("NOT p.path CONTAINS '__faces'")
+    # Phone uploads sent to "staging" get a node but stay out of the grid until
+    # a future promote step flips the flag.
+    conditions.append("(p.staged IS NULL OR p.staged = false)")
+    if undated:
+        # The "0000" / no-date bucket — scanned albums and the like with no
+        # timestamp at all. Confidence + year filters don't apply here.
+        conditions.append("p.timestamp IS NULL")
+    elif min_confidence in CONFIDENCE_SETS:
+        conditions.append("p.timestamp_confidence IN $conf_values")
+        params["conf_values"] = CONFIDENCE_SETS[min_confidence]
+    # ts_from / ts_to (ISO timestamps) override year_from / year_to when present.
+    effective_from = ts_from or (f"{year_from}-01-01" if year_from is not None else None)
+    effective_to   = ts_to   or (f"{year_to + 1}-01-01" if year_to is not None else None)
+    if effective_from is not None:
+        conditions.append("p.timestamp >= $ts_from")
+        params["ts_from"] = effective_from
+    if effective_to is not None:
+        conditions.append("p.timestamp < $ts_to")
+        params["ts_to"] = effective_to
+    if media_type == "photo":
+        conditions.append("p:Photo")
+    elif media_type == "video":
+        conditions.append("p:Video")
+    # GPS presence — latitude/longitude are set together at extraction time.
+    if gps == "has":
+        conditions.append("p.latitude IS NOT NULL")
+    elif gps == "none":
+        conditions.append("p.latitude IS NULL")
+    # "both" (or anything else) = no GPS condition.
+    if camera_model:
+        conditions.append("p.camera_model = $camera_model")
+        params["camera_model"] = camera_model
+    # Detected-but-unassigned faces. `face_count` was backfilled from the
+    # .faces.json sidecars (num_faces). A face is "handled" once it's either
+    # assigned (an APPEARS_IN edge carrying its face_index) or skipped
+    # (m.skipped_faces). So unassigned work remains when the detected count
+    # exceeds assigned + skipped.
+    if unassigned_faces:
+        conditions.append(
+            "p.face_count > 0 AND p.face_count > "
+            "size(coalesce(p.skipped_faces, [])) + "
+            "COUNT { (p)<-[r:APPEARS_IN]-(:Person) WHERE r.face_index IS NOT NULL }"
+        )
+    ids = [i.strip() for i in person_ids.split(",") if i.strip()] if person_ids else []
+    if ids:
+        conditions.append("ALL(pid IN $person_ids WHERE EXISTS { (:Person {id: pid})-[:APPEARS_IN]->(p) })")
+        params["person_ids"] = ids
+        match = "MATCH (p:Media)"
+    else:
+        match = "MATCH (p:Media)"
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    return "MATCH (p:Media)", where, params
+
+
 @router.get("")
 async def list_media(
     limit:          int           = Query(default=48, le=200),
@@ -54,76 +132,14 @@ async def list_media(
     camera_model:   Optional[str] = Query(default=None),       # exact camera_model match
     unassigned_faces: bool        = Query(default=False),      # only media with detected-but-unassigned faces
 ):
-    conditions = []
-    params: dict = {"offset": offset, "limit": limit}
+    match, where, filter_params = build_media_filters(
+        min_confidence=min_confidence, year_from=year_from, year_to=year_to,
+        ts_from=ts_from, ts_to=ts_to, media_type=media_type,
+        person_ids=person_ids, undated=undated, gps=gps,
+        camera_model=camera_model, unassigned_faces=unassigned_faces,
+    )
+    params: dict = {"offset": offset, "limit": limit, **filter_params}
 
-    # The gallery grid is photos + videos only. Scrapbook / yearbook / journal
-    # PAGES are :Document nodes — they belong in Collections (the collection
-    # card shows in Scrapbook), not as ~3,400 individual tiles flooding the
-    # grid. Face-crop thumbnails (__faces) are internal artifacts, never items.
-    conditions.append("NOT p:Document")
-    conditions.append("NOT p.path CONTAINS '__faces'")
-    # Phone uploads sent to "staging" get a node but stay out of the grid until
-    # a future promote step flips the flag.
-    conditions.append("(p.staged IS NULL OR p.staged = false)")
-
-    if undated:
-        # The "0000" / no-date bucket — scanned albums and the like with no
-        # timestamp at all. Confidence + year filters don't apply here.
-        conditions.append("p.timestamp IS NULL")
-    elif min_confidence in CONFIDENCE_SETS:
-        conditions.append("p.timestamp_confidence IN $conf_values")
-        params["conf_values"] = CONFIDENCE_SETS[min_confidence]
-
-    # ts_from / ts_to (ISO timestamps) override year_from / year_to when present.
-    effective_from = ts_from or (f"{year_from}-01-01" if year_from is not None else None)
-    effective_to   = ts_to   or (f"{year_to + 1}-01-01" if year_to is not None else None)
-
-    if effective_from is not None:
-        conditions.append("p.timestamp >= $ts_from")
-        params["ts_from"] = effective_from
-
-    if effective_to is not None:
-        conditions.append("p.timestamp < $ts_to")
-        params["ts_to"] = effective_to
-
-    if media_type == "photo":
-        conditions.append("p:Photo")
-    elif media_type == "video":
-        conditions.append("p:Video")
-
-    # GPS presence — latitude/longitude are set together at extraction time.
-    if gps == "has":
-        conditions.append("p.latitude IS NOT NULL")
-    elif gps == "none":
-        conditions.append("p.latitude IS NULL")
-    # "both" (or anything else) = no GPS condition.
-
-    if camera_model:
-        conditions.append("p.camera_model = $camera_model")
-        params["camera_model"] = camera_model
-
-    # Detected-but-unassigned faces. `face_count` was backfilled from the
-    # .faces.json sidecars (num_faces). A face is "handled" once it's either
-    # assigned (an APPEARS_IN edge carrying its face_index) or skipped
-    # (m.skipped_faces). So unassigned work remains when the detected count
-    # exceeds assigned + skipped.
-    if unassigned_faces:
-        conditions.append(
-            "p.face_count > 0 AND p.face_count > "
-            "size(coalesce(p.skipped_faces, [])) + "
-            "COUNT { (p)<-[r:APPEARS_IN]-(:Person) WHERE r.face_index IS NOT NULL }"
-        )
-
-    ids = [i.strip() for i in person_ids.split(",") if i.strip()] if person_ids else []
-    if ids:
-        conditions.append("ALL(pid IN $person_ids WHERE EXISTS { (:Person {id: pid})-[:APPEARS_IN]->(p) })")
-        params["person_ids"] = ids
-        match = "MATCH (p:Media)"
-    else:
-        match = "MATCH (p:Media)"
-
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
     order = "ASC" if sort == "asc" else "DESC"
     count_q = f"{match} {where} RETURN count(p) AS total"
@@ -179,6 +195,61 @@ async def list_media(
         "total":    total,
         "offset":   offset,
         "has_more": offset + limit < total,
+    }
+
+
+
+@router.get("/counts")
+async def media_counts(
+    bucket:         str           = Query(default="month"),   # month | day
+    min_confidence: str           = Query(default="high"),
+    media_type:     str           = Query(default="all"),
+    person_ids:     Optional[str] = Query(default=None),
+    gps:            str           = Query(default="both"),
+    camera_model:   Optional[str] = Query(default=None),
+):
+    """How many media items fall in each date bucket, newest first.
+
+    The virtualised grid needs to know how tall the whole timeline is before it
+    has any photographs. Fetching 150k rows to find out would defeat the point,
+    so this returns one row per month (or day) and the grid estimates the rest:
+    photos per bucket, divided by how many fit a row at the current width,
+    gives a height it can reserve. Real dimensions replace the estimate as
+    ranges load.
+
+    It's also what makes the date scrubber instant — jumping to June 2015 is a
+    lookup in this list rather than paging backwards through a decade.
+
+    Filters mirror /gallery exactly (shared builder), because a count that
+    disagrees with the items reserves space that never fills.
+    """
+    if bucket not in ("month", "day"):
+        raise HTTPException(400, "bucket must be 'month' or 'day'")
+    width = 7 if bucket == "month" else 10
+
+    match, where, params = build_media_filters(
+        min_confidence=min_confidence, media_type=media_type,
+        person_ids=person_ids, gps=gps, camera_model=camera_model,
+    )
+    # Undated media has no bucket to live in; the grid shows it in its own
+    # section, so exclude it here rather than inventing a date.
+    where = (where + " AND " if where else "WHERE ") + "p.timestamp IS NOT NULL"
+    params["width"] = width
+
+    q = f"""
+    {match} {where}
+    WITH substring(toString(p.timestamp), 0, $width) AS bucket, count(p) AS n
+    RETURN bucket, n ORDER BY bucket DESC
+    """
+
+    async with get_session() as session:
+        res = await session.run(q, **params)
+        rows = [{"bucket": r["bucket"], "count": r["n"]} async for r in res]
+
+    return {
+        "bucket": bucket,
+        "buckets": rows,
+        "total": sum(r["count"] for r in rows),
     }
 
 
@@ -516,20 +587,74 @@ async def place_shortcuts():
                 continue
     except Exception:
         pass
-    return sorted(out, key=lambda p: p["name"])
+
+    # Several shortcuts are the same spot under two names — "didi-house" and
+    # "didis", "seacoast" and "seacoast-classical". Both stay valid for anything
+    # that already refers to them by name; the picker just shows one, or the
+    # same place appears twice and neither is obviously right.
+    #
+    # The longer name wins: it is the more specific one, and "Seacoast
+    # Classical" tells you more than "Seacoast".
+    by_coord: dict = {}
+    for place in out:
+        key = (round(place["latitude"], 5), round(place["longitude"], 5))
+        kept = by_coord.get(key)
+        if kept is None or len(place["name"]) > len(kept["name"]):
+            by_coord[key] = place
+
+    return sorted(by_coord.values(), key=lambda p: p["name"])
+
+
+# The archive is overwhelmingly a New Hampshire family. Searching "Haverhill"
+# should offer the one twenty minutes away before the one in Suffolk, England.
+_NEW_ENGLAND = ("New Hampshire", "Massachusetts", "Maine", "Vermont",
+                "Rhode Island", "Connecticut")
+# Roughly New England, for Nominatim's soft viewbox bias.
+_NE_VIEWBOX = "-73.8,47.5,-66.9,40.9"
+
+
+def _place_rank(display_name: str) -> int:
+    """Lower sorts first. Home state, then the region, then anywhere."""
+    if "New Hampshire" in display_name:
+        return 0
+    if any(state in display_name for state in _NEW_ENGLAND):
+        return 1
+    if "United States" in display_name:
+        return 2
+    return 3
 
 
 @router.get("/geocode")
-async def geocode(q: str = Query(..., min_length=2)):
+async def geocode(
+    q: str = Query(..., min_length=2),
+    anywhere: bool = Query(default=False, description="Drop the US/New England bias"),
+):
     """Free-text place → candidate coordinates via OpenStreetMap Nominatim, so
-    the location editor accepts "Haverhill, MA" instead of raw lat/lon. Returns
-    up to 5 candidates (display_name + lat/lon)."""
+    the location editor accepts "Haverhill, MA" instead of raw lat/lon.
+
+    Results are biased toward home. Nominatim's own ordering is by prominence,
+    which puts the English Haverhill above the one this family actually lives
+    near — so the request carries a New England viewbox and the results are then
+    re-ranked by state. `anywhere=true` turns that off, for the holiday photos.
+    """
     import httpx
+    params = {
+        "q": q,
+        "format": "json",
+        # Ask for more than we show: the re-rank below needs candidates to
+        # choose between, and Nominatim returns them by prominence.
+        "limit": 15,
+    }
+    if not anywhere:
+        params["countrycodes"] = "us"
+        params["viewbox"] = _NE_VIEWBOX
+        # bounded=0: a hint, not a fence. Austin still needs to be findable.
+        params["bounded"] = 0
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
                 "https://nominatim.openstreetmap.org/search",
-                params={"q": q, "format": "json", "limit": 5},
+                params=params,
                 headers={"User-Agent": "ourkin-family-archive/1.0 (personal, non-commercial)"},
             )
         r.raise_for_status()
@@ -537,6 +662,7 @@ async def geocode(q: str = Query(..., min_length=2)):
     except Exception as e:
         log.warning(f"geocode failed for {q!r}: {e}")
         raise HTTPException(502, "Geocoding service unavailable")
+
     out = []
     for d in data:
         try:
@@ -547,7 +673,61 @@ async def geocode(q: str = Query(..., min_length=2)):
             })
         except (KeyError, TypeError, ValueError):
             continue
-    return out
+
+    if not anywhere:
+        # Stable sort: within a rank, Nominatim's prominence ordering stands.
+        out.sort(key=lambda o: _place_rank(o["display_name"] or ""))
+    return out[:8]
+
+
+@router.post("/media/rotate")
+async def rotate_media_endpoint(
+    request: Request,
+    path: str = Query(...),
+    degrees: int = Query(default=90, description="90, 180 or 270, clockwise"),
+):
+    """Turn a photograph, and everything that has to turn with it.
+
+    JPEGs go through jpegtran, which rearranges DCT blocks rather than decoding
+    and re-encoding — lossless, because an archive should not shed a little
+    quality every time somebody straightens a scan.
+
+    Face bounding boxes are transformed and the face crops rotated to match.
+    Leave those and every face lands boxed on the wrong side of the picture,
+    which is worse than not offering rotation at all.
+    """
+    from app.services.rotate import rotate_media
+
+    try:
+        result = rotate_media(
+            settings.photos_root, path, degrees,
+            thumbs_root=settings.photos_root / "__thumbs",
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except FileNotFoundError:
+        raise HTTPException(404, "Media not found")
+    except Exception as e:
+        log.warning(f"rotate failed for {path!r}: {e}")
+        raise HTTPException(500, f"could not rotate: {e}")
+
+    # The graph carries display dimensions, which have just swapped.
+    async with get_session() as session:
+        await session.run(
+            "MATCH (m:Media {path: $path}) SET m.width = $w, m.height = $h",
+            path=path, w=result["width"], h=result["height"],
+        )
+
+    logger.bind(
+        event="media.rotated",
+        path=path, degrees=degrees,
+        lossless=result["lossless"],
+        faces_moved=result["faces"],
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("media rotated")
+
+    return result
 
 
 @router.delete("/media", status_code=204)
@@ -878,11 +1058,19 @@ async def media_detail(path: str = Query(...)):
                 "dominantColor": media.get("dominantColor"),
                 "meanColor":     media.get("meanColor"),
                 "salientColor":  media.get("salientColor"),
+                # A Live Photo is a different object from a still — it has motion,
+                # and the viewer had no way to know.
+                "isLivePhoto":   media.get("isLivePhoto"),
+                "liveDuration":  (media.get("livePhotoInfo") or {}).get("duration"),
             },
             "timestamp": {
                 "value":      ts.get("timestamp"),
                 "source":     ts.get("source"),
                 "confidence": ts.get("confidence"),
+                # The zone the photograph was taken in, not the one the reader
+                # happens to be in. A 1998 holiday shown in the reader's current
+                # timezone is quietly wrong.
+                "timezone":   geoloc.get("timezone"),
             },
             "location": {
                 "latitude":             primary_loc.get("latitude"),
@@ -895,11 +1083,31 @@ async def media_detail(path: str = Query(...)):
                 "landmark":             top_landmark["landmark"]["name"] if top_landmark else None,
                 "landmark_category":    top_landmark["landmark"]["category"] if top_landmark else None,
                 "landmark_distance_m":  top_landmark["distance"] if top_landmark else None,
+                # Nearly every photograph has several nearby named features. The
+                # single nearest is often a stream nobody has heard of while the
+                # third is the lake they were actually at.
+                "landmarks": [
+                    {
+                        "name":       (l.get("landmark") or {}).get("name"),
+                        "category":   (l.get("landmark") or {}).get("category"),
+                        "distance_m": l.get("distance"),
+                        "confidence": l.get("confidence"),
+                    }
+                    for l in landmarks[:8]
+                    if (l.get("landmark") or {}).get("name")
+                ],
+                "altitude_m":  primary_loc.get("altitude"),
+                "accuracy":    primary_loc.get("accuracy"),
+                "postal_code": geoloc.get("postal_code"),
+                "timezone":    geoloc.get("timezone"),
             } if primary_loc.get("latitude") else None,
             "camera": {
                 "make":  camera.get("make"),
                 "model": camera.get("model"),
                 "lens":  camera.get("lens"),
+                # The OS build that wrote the file — sometimes the only clue to
+                # when a scan was actually digitised.
+                "software": camera.get("software"),
             } if camera else None,
             "settings": {
                 "iso":          expos.get("iso"),
@@ -907,11 +1115,22 @@ async def media_detail(path: str = Query(...)):
                 "shutterSpeed": expos.get("shutterSpeed"),
                 "focalLength":  expos.get("focalLength"),
                 "flash":        expos.get("flash"),
+                "focalLength35mm": expos.get("focalLength35mm"),
             } if expos else None,
             "processing": {
                 "processor":   proc.get("processor"),
                 "extractedAt": proc.get("extractedAt"),
-            },
+                },
+                # mpp's own verdict on whether this file is fully described, with
+                # the specific gaps named. A per-photograph to-do list — what turns
+                # the archive into something you can improve rather than only
+                # browse.
+                "readiness": {
+                    "score":     (meta.get("archiveReadiness") or {}).get("score"),
+                    "mediaType": (meta.get("archiveReadiness") or {}).get("mediaType"),
+                    "missing":   (meta.get("archiveReadiness") or {}).get("missing") or [],
+                    "checks":    (meta.get("archiveReadiness") or {}).get("checks") or {},
+                } if meta.get("archiveReadiness") else None,
         }
     except Exception as e:
         log.warning(f"Failed to parse sidecar for {path}: {e}")

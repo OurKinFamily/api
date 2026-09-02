@@ -1845,6 +1845,38 @@ async def assign_cluster(cluster_id: str, body: AssignBody, request: Request):
     ).info("cluster assigned to person")
 
 
+@router.post("/skip", status_code=204)
+async def skip_faces(body: dict, request: Request):
+    """Dismiss individual faces so they stop being offered for tagging.
+
+    For the strangers in the background: a family archive is full of faces
+    nobody has any intention of naming, and every one of them otherwise sits in
+    the unassigned queue forever, making the real work look endless.
+
+    Recorded on the Media node (`skipped_faces`) rather than in the clustering
+    files, so the decision survives re-clustering — which is the whole point.
+    Reversible: nothing is deleted, and the face itself stays in the sidecar.
+    """
+    faces = body.get("faces") or []
+    items = [
+        (f.get("photo_path"), int(f["face_index"]))
+        for f in faces
+        if f.get("photo_path") and f.get("face_index") is not None
+    ]
+    if not items:
+        raise HTTPException(400, "faces required, each with photo_path and face_index")
+
+    await _add_skipped_faces(items)
+
+    log.bind(
+        event="face.skipped",
+        count=len(items),
+        paths=sorted({p for p, _ in items}),
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("faces skipped")
+
+
 @router.post("/clusters/{cluster_id}/skip", status_code=204)
 async def skip_cluster(cluster_id: str, request: Request):
     clusters = _load(CLUSTERS_FILE, {})
