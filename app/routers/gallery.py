@@ -778,11 +778,9 @@ async def crop_media_endpoint(
 ):
     """Crop a photograph, keeping the original.
 
-    Unlike rotation, this destroys pixels — so the uncropped file is copied to
-    `originals/pre-crop/<path>` before anything is written, and a crop can be
-    undone by putting it back. That is deliberately NOT the trash: a cropped
-    original has not been deleted, and emptying the trash must not destroy the
-    only full copy of something still in the archive.
+    Unlike rotation, this destroys pixels and keeps no copy — there is no undo.
+    Deleting a photograph moves it to the trash; cropping one does not, because
+    at 1.3TB the archive cannot carry a second copy of everything anybody trims.
 
     The rectangle is in the coordinates of the photograph as DISPLAYED, which
     is what the reader drew it on. Mapping it onto the stored pixels is the
@@ -822,7 +820,6 @@ async def crop_media_endpoint(
         path=path, rect=f"{w}x{h}+{x}+{y}",
         lossless=result["lossless"],
         faces_kept=result["faces_kept"], faces_dropped=result["faces_dropped"],
-        original=result["original"],
         by=getattr(request.state, "user_email", None),
         request_id=getattr(request.state, "request_id", None),
     ).info("media cropped")

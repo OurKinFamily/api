@@ -1,10 +1,8 @@
-"""Cropping destroys pixels, so the original has to survive it.
+"""Cropping a photograph, which is destructive and keeps no copy.
 
 Rotation is reversible — four quarter-turns and the file is bit-for-bit where
-it started. A crop is not, which is why the uncropped photograph is copied to
-originals/pre-crop/ before anything is written, and why that is NOT the trash:
-emptying the trash must not destroy the only full copy of something still in
-the archive.
+it started. A crop is not, and nothing is preserved: at 1.3TB the archive
+cannot carry a second copy of everything anybody trims.
 
 The rectangle is drawn on the photograph as DISPLAYED. A portrait phone photo
 is stored landscape with an EXIF orientation tag, so cropping "the top" without
@@ -68,43 +66,21 @@ class TestTheRectangleIsWhatWasDrawn:
         assert stored_rect((0, 0, 100, 200), 3024, 4032, 6) == (0, 2924, 200, 100)
 
 
-class TestTheOriginalSurvives:
-    def test_it_is_copied_before_the_crop(self, tmp_path):
-        photos = tmp_path / "photos"
-        (photos / "archive" / "2026").mkdir(parents=True)
-        rel = "archive/2026/p.jpg"
-        write_jpeg(photos / rel)
+class TestItIsDestructive:
+    """No copy is kept. Worth a test, because the opposite was true for an
+    afternoon and a reader of this file could reasonably assume it still is."""
 
-        result = crop_media(photos, rel, RECT)
-
-        kept = photos / result["original"]
-        assert kept.is_file()
-        with Image.open(kept) as im:
-            assert im.size == (640, 480)          # untouched
-        with Image.open(photos / rel) as im:
-            assert im.size == (320, 240)          # cropped
-
-    def test_it_is_not_in_the_trash(self, tmp_path):
-        """Emptying the trash must not destroy the only full copy."""
+    def test_no_original_is_squirrelled_away(self, tmp_path):
         photos = tmp_path / "photos"
         (photos / "archive").mkdir(parents=True)
         write_jpeg(photos / "archive" / "p.jpg")
 
         result = crop_media(photos, "archive/p.jpg", RECT)
 
-        assert "trash" not in result["original"]
-        assert result["original"].startswith("originals/pre-crop/")
-
-    def test_a_second_crop_does_not_overwrite_the_true_original(self, tmp_path):
-        photos = tmp_path / "photos"
-        (photos / "archive").mkdir(parents=True)
-        write_jpeg(photos / "archive" / "p.jpg")
-
-        first = crop_media(photos, "archive/p.jpg", RECT)
-        crop_media(photos, "archive/p.jpg", (0, 0, 128, 96))
-
-        with Image.open(photos / first["original"]) as im:
-            assert im.size == (640, 480)
+        assert "original" not in result
+        assert not (photos / "originals").exists()
+        with Image.open(photos / "archive" / "p.jpg") as im:
+            assert im.size == (320, 240)
 
 
 class TestFaces:

@@ -1,9 +1,14 @@
-"""Cropping a photograph, keeping the original.
+"""Cropping a photograph.
 
-Rotation is reversible: turn a photograph four times and it is exactly where it
-started, bit for bit. Cropping is not — the pixels outside the rectangle are
-gone. So the original is moved aside before anything is written, the way
-deleting already works, and a crop can be undone by putting it back.
+Destructive, deliberately. Rotation is reversible — four quarter-turns and the
+file is bit-for-bit where it started — but a crop throws pixels away and there
+is no copy kept. An earlier version preserved the uncropped file under
+originals/, and that was dropped: at 1.3TB the archive cannot carry a second
+copy of everything anybody trims, and a store of originals nobody intends to
+restore from is just a slow leak.
+
+What this means for a caller: check the rectangle before sending it. There is
+no undo.
 
 JPEGs are cropped with jpegtran, which rearranges DCT blocks rather than
 decoding and re-encoding. The catch is that it can only cut on the MCU grid, so
@@ -122,24 +127,6 @@ def _crop_with_pillow(path: Path, rect) -> None:
         im.save(path, **params)
 
 
-def preserve_original(photos_root: Path, rel_path: str) -> str:
-    """Put the uncropped photograph somewhere it can be found again.
-
-    Beside the trash rather than in it: a cropped original has not been
-    deleted, and mixing the two would make "empty the trash" destroy the only
-    copy of something still in the archive. Same disk, so restic already backs
-    it up.
-    """
-    src = photos_root / rel_path
-    dst = photos_root / "originals" / "pre-crop" / rel_path
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    # Never overwrite: the first original is the one worth keeping. A second
-    # crop of an already-cropped file must not replace the true original.
-    if not dst.exists():
-        shutil.copy2(src, dst)
-    return str(dst.relative_to(photos_root))
-
-
 def crop_media(
     photos_root: Path,
     rel_path: str,
@@ -150,9 +137,9 @@ def crop_media(
 ) -> dict:
     """Crop a photograph to `rect` — (x, y, w, h) on the DISPLAYED image.
 
-    The original is copied aside first. Everything that describes the picture
-    moves with it: face boxes shift, faces cropped away are dropped, the
-    sidecar's dimensions change, and every cached rendition is deleted.
+    Everything describing the picture moves with it: face boxes shift, faces
+    cropped away are dropped, the sidecar's dimensions change, and every cached
+    rendition is deleted. The pixels outside the rectangle are gone for good.
     """
     src = (photos_root / rel_path).resolve()
     if not src.is_file():
@@ -169,8 +156,6 @@ def crop_media(
         raise ValueError(f"crop must be at least {MIN_SIDE}x{MIN_SIDE}")
     if (x, y, w, h) == (0, 0, old_w, old_h):
         raise ValueError("crop matches the whole photograph")
-
-    original = preserve_original(photos_root, rel_path)
 
     orientation = _exif_orientation(src)
     lossless = False
@@ -231,7 +216,4 @@ def crop_media(
     except OSError:
         version = 0
 
-    return {
-        "width": new_w, "height": new_h, "version": version,
-        "original": original, **touched,
-    }
+    return {"width": new_w, "height": new_h, "version": version, **touched}
