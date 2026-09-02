@@ -26,6 +26,17 @@ router = APIRouter(prefix="/gallery", tags=["gallery"])
 # `logger.bind(...).info(...)` for structured events.
 log = logger
 
+def crop_from_sidecar(faces_data: dict, face_index) -> str | None:
+    """The crop path the face worker actually recorded, relative to the root."""
+    for face in (faces_data or {}).get("faces", []):
+        if face.get("face_index") != face_index:
+            continue
+        recorded = (face.get("crop_path") or "").replace("/photos/", "", 1)
+        if recorded and (settings.photos_root / recorded).exists():
+            return recorded
+    return None
+
+
 VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.m4v', '.mpg', '.mpeg'}
 
 # Exclusive levels: each filter shows ONLY that confidence (not a floor), so
@@ -1040,12 +1051,15 @@ async def media_detail(path: str = Query(...)):
                 # since gone, and an assigned face used to get a URL regardless
                 # — 404ing in the lightbox. Unassigned faces below already
                 # checked; this makes the two consistent.
+                # Fall back to the sidecar when the edge has no crop path, or
+                # has one whose file is gone. Assignment used to guess the
+                # location from the archive path, which is wrong for anything
+                # mis-dated — the crops are filed by DATE — so those edges
+                # carry nothing and the face rendered as a broken image.
                 cp = p.get("crop_path")
-                p["crop_url"] = (
-                    with_v(f"/api/media/{cp}")
-                    if cp and (settings.photos_root / cp).exists()
-                    else None
-                )
+                if not cp or not (settings.photos_root / cp).exists():
+                    cp = crop_from_sidecar(fd, p.get("face_index"))
+                p["crop_url"] = with_v(f"/api/media/{cp}") if cp else None
 
             # Faces not yet assigned to anyone. Use the crop_path the worker
             # recorded in the sidecar — it stores crops by the photo's date,

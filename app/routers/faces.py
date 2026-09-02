@@ -797,12 +797,39 @@ async def bulk_assign_faces(body: dict, request: Request):
         raise HTTPException(400, "person_id and faces required")
 
     def _canonical_crop_path(photo_path: str, face_index) -> str:
-        if not photo_path or face_index is None: return ""
+        """Where the face crop for this photograph actually lives.
+
+        Guessing it from the archive path works only when the two agree. The
+        worker files crops by the photograph's DATE, so a mis-dated file sitting
+        in archive/0000/ has its crops under __faces/crops/2025/12/ — the guess
+        misses, the edge is stored without a crop path, and the detail view then
+        renders an <img> with an empty src, which asks for the page itself and
+        404s.
+
+        The sidecar records where the worker put it, so ask that first and fall
+        back to the guess.
+        """
+        if not photo_path or face_index is None:
+            return ""
+
+        sidecar = settings.photos_root / f"{photo_path}.faces.json"
+        if sidecar.exists():
+            try:
+                data = json.loads(sidecar.read_text())
+                for face in data.get("faces", []):
+                    if face.get("face_index") != face_index:
+                        continue
+                    recorded = (face.get("crop_path") or "").replace("/photos/", "", 1)
+                    if recorded and (settings.photos_root / recorded).exists():
+                        return recorded
+            except (json.JSONDecodeError, OSError):
+                pass
+
         if photo_path.startswith("archive/"):
             stripped = photo_path[len("archive/"):]
             candidate = f"__faces/crops/{stripped}_face{face_index}.jpg"
-            full = settings.photos_root / candidate
-            return candidate if full.exists() else ""
+            if (settings.photos_root / candidate).exists():
+                return candidate
         return ""
 
     by = getattr(request.state, "user_email", None)
