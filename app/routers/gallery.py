@@ -5,6 +5,7 @@ Filters: min_confidence (default: high), year_from, year_to, media_type, person_
 Sort:    actual capture timestamp DESC
 """
 
+import os
 import json
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Literal, Optional
 
 import asyncio
 
+from starlette.background import BackgroundTask
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, field_validator
 from app.config import settings, with_v
@@ -778,6 +780,202 @@ async def rotate_media_endpoint(
     return result
 
 
+class DescriptionBody(BaseModel):
+    description: str | None = None
+
+
+@router.patch("/media/description", status_code=200)
+async def set_media_description(
+    request: Request,
+    path: str = Query(...),
+    body: DescriptionBody = ...,
+):
+    """What somebody wants to say about a photograph, in their own words.
+
+    Stored on the Media node rather than in the file. A description is a
+    judgement about a picture — who is in it, what was happening, which house
+    that is — not a property of the pixels, and the graph is where the archive
+    keeps judgements. It also means writing one never rewrites the file.
+
+    990 heritage scans already carry a description from their import; this is
+    the first way to write one, or to correct one of those.
+    """
+    text = (body.description or "").strip() or None
+    async with get_session() as session:
+        result = await session.run(
+            "MATCH (m:Media {path: $path}) SET m.description = $text "
+            "RETURN m.path AS path",
+            path=path, text=text,
+        )
+        if not await result.single():
+            raise HTTPException(404, "Media not found")
+
+    logger.bind(
+        event="media.described",
+        path=path,
+        cleared=text is None,
+        length=len(text or ""),
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("media description set")
+
+    return {"path": path, "description": text}
+
+
+class DownloadBody(BaseModel):
+    paths: list[str]
+
+
+# A selection is a handful to a few hundred. Past that it is a job for the
+# workshop tools, not a browser download that has to survive a flaky wifi link.
+MAX_DOWNLOAD_FILES = 500
+MAX_DOWNLOAD_BYTES = 4 * 1024 ** 3
+
+
+@router.post("/download")
+async def download_selection(request: Request, body: DownloadBody):
+    """Zip up the selected photographs and hand them back.
+
+    One archive rather than a burst of individual downloads: browsers block
+    those after the second or third, so "download 40 photos" quietly becomes
+    "download 3".
+
+    Written to a temporary file rather than held in memory — a selection can
+    easily be a gigabyte, and the originals are on local disk so building it
+    costs little.
+    """
+    import tempfile
+    import zipfile
+
+    from fastapi.responses import FileResponse
+
+    paths = [p for p in dict.fromkeys(body.paths) if p]
+    if not paths:
+        raise HTTPException(400, "nothing selected")
+    if len(paths) > MAX_DOWNLOAD_FILES:
+        raise HTTPException(413, f"select at most {MAX_DOWNLOAD_FILES} at a time")
+
+    root = settings.photos_root.resolve()
+    files, total = [], 0
+    for rel in paths:
+        src = (settings.photos_root / rel).resolve()
+        # Never let a path climb out of the archive.
+        if not str(src).startswith(str(root)) or not src.is_file():
+            continue
+        total += src.stat().st_size
+        if total > MAX_DOWNLOAD_BYTES:
+            raise HTTPException(413, "selection is too large to download at once")
+        files.append((src, rel))
+
+    if not files:
+        raise HTTPException(404, "none of those are here")
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    tmp.close()
+    with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_STORED) as zf:
+        # ZIP_STORED, not DEFLATE: JPEGs and MP4s are already compressed, so
+        # deflating them spends minutes to save nothing.
+        for src, rel in files:
+            zf.write(src, arcname=Path(rel).name)
+
+    logger.bind(
+        event="media.downloaded",
+        count=len(files), bytes=total,
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("selection downloaded")
+
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    return FileResponse(
+        tmp.name,
+        media_type="application/zip",
+        filename=f"ourkin-{stamp}-{len(files)}-photos.zip",
+        background=BackgroundTask(os.unlink, tmp.name),
+    )
+
+
+@router.post("/media/restore")
+async def restore_preview(request: Request, path: str = Query(...)):
+    """Restore a photograph — to a PREVIEW, leaving the original alone.
+
+    Takes about fifteen seconds. Nothing is written over until `/restore/apply`
+    is called, because a restoration is a machine's opinion about what a
+    photograph used to look like: usually right, and "usually" is exactly why
+    somebody should see it first.
+    """
+    from app.services.restore import make_preview
+
+    try:
+        result = await asyncio.to_thread(make_preview, settings.photos_root, path)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        log.warning(f"restore preview failed for {path!r}: {e}")
+        raise HTTPException(500, f"could not restore: {e}")
+
+    logger.bind(
+        event="media.restore.previewed", path=path,
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("restore preview made")
+
+    return {**result, "preview_url": with_v(f"/api/media/{result['preview']}")}
+
+
+@router.delete("/media/restore", status_code=204)
+async def restore_discard(path: str = Query(...)):
+    """Throw the preview away. The photograph was never touched."""
+    from app.services.restore import discard_preview
+
+    discard_preview(settings.photos_root, path)
+
+
+@router.post("/media/restore/apply")
+async def restore_apply(request: Request, path: str = Query(...)):
+    """Accept the restoration, replacing the original.
+
+    The pre-restoration photograph is copied to originals/ first, mirroring
+    the archive's shape, so this is undoable — unlike cropping, which keeps
+    nothing. A restoration is a model's repainting of the picture, and the scan
+    is the record of the print.
+
+    The pipeline writes PNG and this re-encodes to the original's format,
+    because the archive identifies a photograph by its path — a changed
+    extension would orphan the Media node, the sidecars and every face crop.
+    """
+    from app.services.restore import apply_preview
+
+    try:
+        result = apply_preview(
+            settings.photos_root, path,
+            thumbs_root=settings.photos_root / "__thumbs",
+            cache_roots=(Path("/tmp/thumbs"), Path("/tmp/medium")),
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        log.warning(f"restore apply failed for {path!r}: {e}")
+        raise HTTPException(500, f"could not apply: {e}")
+
+    async with get_session() as session:
+        await session.run(
+            "MATCH (m:Media {path: $path}) "
+            "SET m.width = $w, m.height = $h, m.media_version = $v, m.restored = true",
+            path=path, w=result["width"], h=result["height"], v=result["version"],
+        )
+
+    logger.bind(
+        event="media.restored", path=path,
+        width=result["width"], height=result["height"],
+        faces_moved=result["faces_moved"],
+        original=result["original"],
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("restoration applied")
+
+    return result
+
+
 @router.post("/media/crop")
 async def crop_media_endpoint(
     request: Request,
@@ -957,6 +1155,10 @@ async def media_detail(path: str = Query(...)):
 
     sidecar = Path(str(full_path) + ".json")
     base = {"path": path, "filename": full_path.name}
+    # Filled in from the Media node below. Writing about a photograph is half
+    # of what an archive is for, so it belongs in the payload whether or not a
+    # sidecar exists.
+    base["description"] = None
 
     # Query Neo4j for people (with face_index + crop_path from relationship)
     # and the Media node itself (for heritage fields).
@@ -1106,6 +1308,7 @@ async def media_detail(path: str = Query(...)):
             **base,
             "people": people, "face_count": face_count,
             "unidentified": unidentified, "objects": objects,
+            "description": media_node.get("description"),
             "heritage": heritage,
         }
 
@@ -1155,6 +1358,7 @@ async def media_detail(path: str = Query(...)):
 
         return {
             **base,
+            "description": media_node.get("description"),
             "people":      people,
             "face_count":  face_count,
             "unidentified": unidentified,
