@@ -20,6 +20,50 @@ from pathlib import Path
 
 JPEG_SUFFIXES = {".jpg", ".jpeg"}
 
+# EXIF orientations that include a mirror. The other four are pure rotations.
+MIRRORED_ORIENTATIONS = {2, 4, 5, 7}
+
+# ExifTool's wording, which is what the sidecars already use.
+ORIENTATION_NAMES = {
+    1: "Horizontal (normal)",
+    2: "Mirror horizontal",
+    3: "Rotate 180",
+    4: "Mirror vertical",
+    5: "Mirror horizontal and rotate 270 CW",
+    6: "Rotate 90 CW",
+    7: "Mirror horizontal and rotate 90 CW",
+    8: "Rotate 270 CW",
+}
+
+
+def _exif_orientation(path: Path) -> int:
+    """The file's own orientation tag, or 1 when it has none."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return (im.getexif() or {}).get(274) or 1
+    except Exception:
+        return 1
+
+
+def stored_rotation(degrees: int, orientation: int) -> int:
+    """How far to turn the STORED pixels to turn the DISPLAYED image by `degrees`.
+
+    jpegtran rewrites the pixels and leaves the EXIF orientation tag alone, so
+    a viewer still applies that tag afterwards. Writing `displayed = O(stored)`,
+    what the pixels need is O-inverse . R . O — and in the dihedral group that
+    composes down to a plain rotation: by `degrees` when O is a pure rotation,
+    and by MINUS `degrees` when O contains a mirror, because a reflection
+    reverses the sense of rotation.
+
+    So the common case (orientation 6, every portrait phone photo) is correct
+    only because rotations commute, and the mirrored cases are correct only if
+    we turn the other way. Turning the same way for a mirrored file lands it
+    180 degrees out.
+    """
+    d = degrees % 360
+    return (-d) % 360 if orientation in MIRRORED_ORIENTATIONS else d
+
 
 def rotate_bbox(bbox, width: int, height: int, degrees: int):
     """Move a bounding box to where it lands after the image is rotated.
@@ -139,7 +183,10 @@ def rotate_media(
         before = ImageOps.exif_transpose(im).size
     old_w, old_h = before
 
-    lossless = src.suffix.lower() in JPEG_SUFFIXES and _rotate_jpeg_lossless(src, degrees)
+    orientation = _exif_orientation(src)
+    lossless = src.suffix.lower() in JPEG_SUFFIXES and _rotate_jpeg_lossless(
+        src, stored_rotation(degrees, orientation)
+    )
     if not lossless:
         _rotate_with_pillow(src, degrees)
 
@@ -182,9 +229,16 @@ def rotate_media(
             if meta:
                 dims = (meta.setdefault("media", {})).setdefault("dimensions", {})
                 dims["width"], dims["height"] = new_w, new_h
-                # The pixels are now upright, so any stored orientation would be
-                # applied a second time by anything that reads it.
-                dims["orientation"] = "Horizontal (normal)"
+                # Report what the file actually says, rather than asserting it
+                # is upright. jpegtran leaves the orientation tag in place, so
+                # claiming "Horizontal (normal)" after a lossless rotate left
+                # the sidecar disagreeing with the photograph it describes —
+                # and anything trusting the sidecar over the file would then
+                # size or transpose it wrongly. Only the Pillow path really
+                # clears the tag.
+                dims["orientation"] = ORIENTATION_NAMES.get(
+                    _exif_orientation(src), "Horizontal (normal)"
+                )
                 sidecar.write_text(json.dumps(data, indent=2))
         except (json.JSONDecodeError, OSError):
             pass
@@ -204,4 +258,13 @@ def rotate_media(
         except Exception:
             pass
 
-    return {"width": new_w, "height": new_h, **touched}
+    # A per-file cache token. The URL for a photograph never changes, so a
+    # browser that has already fetched it keeps showing the old pixels no
+    # matter how thoroughly the file was rewritten. The modification time is
+    # the cheapest thing that is guaranteed to differ afterwards.
+    try:
+        version = int(src.stat().st_mtime)
+    except OSError:
+        version = 0
+
+    return {"width": new_w, "height": new_h, "version": version, **touched}

@@ -3,3 +3,6 @@ venv/
 __pycache__/
 *.pyc
 logs/
+
+# runtime job-state backup
+jobs.json.bak
