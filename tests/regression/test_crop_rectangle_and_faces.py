@@ -13,7 +13,9 @@ import json
 import pytest
 from PIL import Image, ImageChops, ImageDraw, ImageOps
 
-from app.services.crop import MIN_SIDE, crop_bbox, crop_media, stored_rect
+from app.services.crop import (
+    MIN_SIDE, align_inward, crop_bbox, crop_media, stored_rect,
+)
 
 ORIENTATIONS = (1, 2, 3, 4, 5, 6, 7, 8)
 # MCU-aligned, so jpegtran is exact rather than rounding outward.
@@ -109,6 +111,91 @@ class TestFaces:
         kept = json.loads(faces.read_text())["faces"]
         assert [f["face_index"] for f in kept] == [0]
         assert kept[0]["bbox"] == [104, 52, 204, 152]
+
+
+class TestUnalignedRectangles:
+    """jpegtran snaps the origin back to the MCU grid, so an arbitrary
+    rectangle starts a few pixels earlier than asked. Compensating for that in
+    DISPLAY space is wrong for an oriented file — the snapping happens on the
+    stored axes, which are not the displayed ones — and the boxes came out
+    slightly off every face.
+    """
+
+    @pytest.mark.parametrize("orientation", ORIENTATIONS)
+    def test_a_face_box_still_lands_on_the_face(self, tmp_path, orientation):
+        from PIL import ImageOps
+
+        def red_bbox(img):
+            px = img.convert("RGB").load()
+            w, h = img.size
+            xs, ys = [], []
+            for j in range(h):
+                for i in range(w):
+                    r, g, b = px[i, j]
+                    if r > 180 and g < 80 and b < 80:
+                        xs.append(i)
+                        ys.append(j)
+            return [min(xs), min(ys), max(xs) + 1, max(ys) + 1] if xs else None
+
+        im = Image.new("RGB", (640, 480), (20, 20, 20))
+        ImageDraw.Draw(im).rectangle([280, 200, 360, 280], fill=(255, 0, 0))
+        exif = im.getexif()
+        exif[274] = orientation
+        path = tmp_path / "p.jpg"
+        im.save(path, quality=95, exif=exif)
+
+        faces = tmp_path / "p.jpg.faces.json"
+        with Image.open(path) as src:
+            faces.write_text(json.dumps({"faces": [
+                {"face_index": 0, "bbox": red_bbox(ImageOps.exif_transpose(src))},
+            ]}))
+
+        # Deliberately off the 16px grid.
+        crop_media(tmp_path, path.name, (101, 53, 400, 340))
+
+        moved = json.loads(faces.read_text())["faces"][0]["bbox"]
+        with Image.open(path) as out:
+            actual = red_bbox(ImageOps.exif_transpose(out))
+        assert max(abs(a - b) for a, b in zip(actual, moved)) <= 2
+
+
+class TestSmallTrims:
+    """The case that made crop look broken.
+
+    jpegtran snaps an unaligned origin BACKWARD and keeps the requested extent,
+    so it hands back the very pixels you asked it to remove. Trimming a 9px
+    border returned the border: the crop reported success, the photograph was
+    unchanged, and from the outside it looked like a button that did nothing.
+    The origin is snapped forward now, cutting up to 15px more than asked —
+    the right direction when the point is to remove a border.
+    """
+
+    def test_a_nine_pixel_border_actually_goes(self, tmp_path):
+        from PIL import ImageOps
+
+        im = Image.new("RGB", (896, 910), (0, 0, 0))
+        ImageDraw.Draw(im).rectangle([9, 8, 886, 901], fill=(230, 230, 230))
+        path = tmp_path / "b.jpg"
+        im.save(path, quality=95)
+
+        result = crop_media(tmp_path, path.name, (9, 8, 878, 894))
+
+        with Image.open(path) as out:
+            shown = ImageOps.exif_transpose(out)
+            px = shown.convert("RGB").load()
+            corners = [
+                px[0, 0], px[shown.width - 1, 0],
+                px[0, shown.height - 1], px[shown.width - 1, shown.height - 1],
+            ]
+        assert not [c for c in corners if sum(c) < 200], "border survived the crop"
+        assert result["lossless"]
+
+    def test_the_origin_moves_forward_not_back(self):
+        # Asking to start at 9 must never start at 0, which is what returned
+        # the trimmed pixels.
+        x, y, w, h = align_inward((9, 8, 887, 902))
+        assert (x, y) == (16, 16)
+        assert x + w == 9 + 887 and y + h == 8 + 902   # far edge respected
 
 
 class TestRefusals:

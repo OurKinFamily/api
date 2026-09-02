@@ -775,6 +775,10 @@ async def crop_media_endpoint(
     y: int = Query(..., ge=0, description="top edge, in displayed pixels"),
     w: int = Query(..., gt=0, description="width, in displayed pixels"),
     h: int = Query(..., gt=0, description="height, in displayed pixels"),
+    angle: float = Query(
+        0.0, ge=-45, le=45,
+        description="straighten clockwise by this many degrees before cropping",
+    ),
 ):
     """Crop a photograph, keeping the original.
 
@@ -791,12 +795,18 @@ async def crop_media_endpoint(
     rectangle outward: the result can be a few pixels larger than asked. Face
     boxes are moved by what actually happened rather than what was requested,
     and faces left mostly outside the frame are dropped.
+
+    `angle` straightens first, clockwise, and the rectangle is read against the
+    straightened picture — the caller drew it on a preview that was already
+    turned. Straightening cannot be lossless: jpegtran works in whole blocks
+    and whole quarter-turns, so any other angle costs one re-encode. Worth it
+    for a crooked scan, which is the only thing anybody straightens.
     """
     from app.services.crop import crop_media
 
     try:
         result = crop_media(
-            settings.photos_root, path, (x, y, w, h),
+            settings.photos_root, path, (x, y, w, h), angle=angle,
             thumbs_root=settings.photos_root / "__thumbs",
             cache_roots=(Path("/tmp/thumbs"), Path("/tmp/medium")),
         )
