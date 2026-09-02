@@ -958,9 +958,22 @@ async def unassign_face(request: Request, person_id: str, photo_path: str, face_
     global _neo4j_assigned
     _neo4j_assigned = None
 
+    # Taking a name off a face is somebody saying "that is not them". Removing
+    # the edge alone only stops it counting as an example; the face stays in
+    # the pool of things that look like that person, and the suggestion which
+    # produced the wrong answer produces it again. The negative is what makes
+    # the correction stick.
+    negatives = 0
+    try:
+        from app.services.brain import append_negatives
+        negatives = append_negatives(person_id, [(pp, face_index)])
+    except Exception as e:
+        log.warning(f"could not record negative for {person_id}: {e}")
+
     person_name = await _get_person_name(person_id)
     log.bind(
         event="face.unassigned",
+        negatives_added=negatives,
         person_id=person_id,
         person_name=person_name,
         photo_path=pp,
