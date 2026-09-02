@@ -180,6 +180,12 @@ async def list_media(
             # Seconds. Lets a video tile show its length without the client
             # having to fetch the file to find out.
             "duration":       p.get("duration"),
+            # Set when the file has been edited in place — rotated, most
+            # obviously. The URL of a photograph never changes, so without a
+            # token the browser goes on serving the pixels it cached before
+            # the edit, and the rotation appears to have been forgotten on
+            # the next page load.
+            "version":        p.get("media_version"),
             "width":          p.get("width"),
             "height":         p.get("height"),
             "place_name":     p.get("place_name"),
@@ -702,6 +708,11 @@ async def rotate_media_endpoint(
         result = rotate_media(
             settings.photos_root, path, degrees,
             thumbs_root=settings.photos_root / "__thumbs",
+            # The on-demand caches the media routes fall back to. Leaving
+            # these behind means a rotated photograph keeps its old thumbnail
+            # even after a hard refresh, because the stale file is still on
+            # disk and gets served in preference to regenerating.
+            cache_roots=(Path("/tmp/thumbs"), Path("/tmp/medium")),
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -714,8 +725,10 @@ async def rotate_media_endpoint(
     # The graph carries display dimensions, which have just swapped.
     async with get_session() as session:
         await session.run(
-            "MATCH (m:Media {path: $path}) SET m.width = $w, m.height = $h",
+            "MATCH (m:Media {path: $path}) "
+            "SET m.width = $w, m.height = $h, m.media_version = $v",
             path=path, w=result["width"], h=result["height"],
+            v=result["version"],
         )
 
     logger.bind(

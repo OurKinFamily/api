@@ -165,6 +165,7 @@ def rotate_media(
     degrees: int,
     *,
     thumbs_root: Path | None = None,
+    cache_roots: tuple[Path, ...] | None = None,
 ) -> dict:
     """Rotate a photograph and bring its metadata with it.
 
@@ -243,13 +244,24 @@ def rotate_media(
         except (json.JSONDecodeError, OSError):
             pass
 
-    # ── cached thumbnail: stale the moment the pixels move ──────────────────
-    if thumbs_root:
-        thumb = thumbs_root / (rel_path.removeprefix("archive/") + ".webp")
-        for candidate in (thumb, thumb.with_suffix(""), Path(str(thumb).replace(".webp", ""))):
-            if candidate.is_file():
-                candidate.unlink(missing_ok=True)
-                touched["thumb"] = True
+    # ── derived copies: stale the moment the pixels move ────────────────────
+    #
+    # Every one of these is regenerated on demand, so deleting is the whole
+    # fix. Missing one is worse than it sounds: the grid went on showing the
+    # old thumbnail after a rotate, and a reader with no reason to open the
+    # photograph would never have seen it turn.
+    #
+    # There are three caches, not one — the webp tree beside the archive, and
+    # two on-demand caches under /tmp that the media routes fall back to. They
+    # share a key: the path with "archive/" stripped, plus ".webp".
+    key = rel_path.removeprefix("archive/") + ".webp"
+    for root in (thumbs_root, *(cache_roots or ())):
+        if not root:
+            continue
+        cached = root / key
+        if cached.is_file():
+            cached.unlink(missing_ok=True)
+            touched["thumb"] = True
 
     poster = Path(str(src) + ".poster.jpg")
     if poster.is_file():

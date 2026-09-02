@@ -75,6 +75,28 @@ class TestRotatingRealFiles:
         assert mean_difference(actual, expected) < 5
         assert (result["width"], result["height"]) == expected.size
 
+    def test_every_derived_cache_is_dropped(self, tmp_path):
+        """A thumbnail regenerates on demand, so deleting it is the whole fix
+        — but there are three caches and only one used to be cleared. The grid
+        went on showing the old thumbnail after a rotate.
+        """
+        photos = tmp_path / "photos"
+        (photos / "archive" / "2026").mkdir(parents=True)
+        write_jpeg(photos / "archive" / "2026" / "p.jpg", 1)
+
+        key = "2026/p.jpg.webp"
+        roots = [photos / "__thumbs", tmp_path / "thumbs", tmp_path / "medium"]
+        for root in roots:
+            (root / key).parent.mkdir(parents=True, exist_ok=True)
+            (root / key).write_bytes(b"stale")
+
+        rotate_media(
+            photos, "archive/2026/p.jpg", 90,
+            thumbs_root=roots[0], cache_roots=tuple(roots[1:]),
+        )
+
+        assert not any((root / key).exists() for root in roots)
+
     def test_version_is_the_new_modification_time(self, tmp_path):
         path = write_jpeg(tmp_path / "p.jpg", 1)
         before = path.stat().st_mtime
