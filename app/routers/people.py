@@ -103,6 +103,72 @@ async def list_people(request: Request, viewer_id: str | None = None):
         ]
 
 
+@router.get("/{person_id}/ancestors")
+async def person_ancestors(person_id: str, generations: int = 5):
+    """Somebody's ancestors, numbered for a pedigree chart.
+
+    Ahnentafel numbering: the subject is 1, their father 2, their mother 3, and
+    the parents of slot n are 2n and 2n+1. It is four centuries old and it is
+    still the right answer — every ancestor has one fixed number, so a chart can
+    place them without walking a tree, and a missing slot is plainly a gap
+    rather than a shorter branch.
+
+    Where a parent's gender is unknown the slots are filled in the order the
+    graph returns them. That is a guess about which side of the chart somebody
+    sits on, not about who they are.
+    """
+    generations = max(1, min(generations, 8))
+    frontier = {1: person_id}
+    people: dict[int, dict] = {}
+
+    async with get_session() as session:
+        for _ in range(generations):
+            if not frontier:
+                break
+            result = await session.run(
+                """
+                UNWIND $ids AS row
+                MATCH (child:Person {id: row.id})<-[:PARENT_OF]-(parent:Person)
+                RETURN row.slot AS slot, parent.id AS id, parent.name AS name,
+                       parent.known_as AS known_as, parent.avatar AS avatar,
+                       parent.gender AS gender,
+                       parent.birth_date AS birth_date,
+                       parent.death_date AS death_date
+                ORDER BY parent.name
+                """,
+                ids=[{"slot": slot, "id": pid} for slot, pid in frontier.items()],
+            )
+            rows = await result.data()
+
+            next_frontier: dict[int, str] = {}
+            for row in rows:
+                base = row["slot"] * 2
+                gender = (row.get("gender") or "").lower()
+                if gender.startswith("f"):
+                    slot = base + 1
+                elif gender.startswith("m"):
+                    slot = base
+                else:
+                    slot = base if base not in people else base + 1
+                # Two parents of the same recorded gender: the second takes the
+                # empty slot rather than overwriting the first.
+                if slot in people:
+                    slot = base if base not in people else base + 1
+                if slot in people:
+                    continue
+                people[slot] = {
+                    "slot": slot,
+                    "generation": slot.bit_length() - 1,
+                    "id": row["id"], "name": row["name"],
+                    "known_as": row["known_as"], "avatar": row["avatar"],
+                    "birth_date": row["birth_date"], "death_date": row["death_date"],
+                }
+                next_frontier[slot] = row["id"]
+            frontier = next_frontier
+
+    return {"generations": generations, "ancestors": sorted(people.values(), key=lambda p: p["slot"])}
+
+
 @router.get("/with-biography")
 async def people_with_biography(request: Request):
     """Slim list of people who have a non-empty biography — for the Biographies

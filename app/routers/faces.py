@@ -570,6 +570,11 @@ def _event_key(meta: dict):
     return (date,)  # date-only bucket if no GPS
 
 
+# How many candidates are worth enriching. Nobody works through more than a
+# few hundred faces in a sitting, and the enrichment is the entire cost.
+ENRICH_CAP = 1500
+
+
 @router.post("/search/by_person_temporal")
 async def search_similar_faces_temporal(body: SearchByPersonTemporalBody):
     """
@@ -677,41 +682,78 @@ async def search_similar_faces_temporal(body: SearchByPersonTemporalBody):
     )
     exclude = person_faces | (neo4j_assigned if body.unassigned_only else set())
 
-    # Search with each bucket mean, keep max similarity per face
-    best: dict[tuple[str, int], dict] = {}
-    for q in bucket_means:
-        sims  = matrix @ q
-        order = np.argsort(-sims)
-        for i in order:
-            sim = float(sims[i])
-            if sim < (1.0 - body.threshold):
-                break
-            m   = meta[i]
-            rel = m["photo_path"].replace("/photos/", "", 1) if m["photo_path"].startswith("/photos/") else m["photo_path"]
-            key = (rel, int(m["face_index"]))
-            if key in exclude:
-                continue
-            if key not in best or sim > best[key]["similarity"]:
-                crop = m.get("crop_path", "")
-                crop_url = with_v(f"/api/media/{crop.replace('/photos/', '', 1)}") if crop.startswith("/photos/") else with_v(f"/api/media/{crop}")
-                best[key] = {
-                    "photo_path": rel,
-                    "face_index": m["face_index"],
-                    "crop_url":   crop_url,
-                    "similarity": round(sim, 4),
-                    "distance":   round(1.0 - sim, 4),
-                }
+    # Run the scan off the event loop.
+    #
+    # This is numpy and a dict build with no await in it, so it holds the
+    # single worker thread for as long as it runs — and while it does, every
+    # other request queues behind it. A slow sweep for one heavily-tagged
+    # person took the whole API down, gallery included. In a thread it stays
+    # what it should be: one slow page.
+    def _scan():
+        best: dict[tuple[str, int], dict] = {}
+        # Search with each bucket mean, keep max similarity per face
+        floor = 1.0 - body.threshold
+        for q in bucket_means:
+            sims = matrix @ q
+            # Select and rank in numpy rather than walking every face in Python.
+            #
+            # This sorted all ~190,000 embeddings and then stepped through them
+            # one at a time, per centroid, doing string work on each — for
+            # somebody with twenty thousand confirmed faces and a loose
+            # threshold that is millions of iterations, and it took over ten
+            # minutes. Only the best few thousand per bucket can survive the
+            # merge and the cap below, so the rest need never be touched.
+            above = np.flatnonzero(sims >= floor)
+            if above.size > ENRICH_CAP:
+                above = above[np.argpartition(-sims[above], ENRICH_CAP - 1)[:ENRICH_CAP]]
+            for i in above[np.argsort(-sims[above])]:
+                sim = float(sims[i])
+                m   = meta[i]
+                rel = m["photo_path"].replace("/photos/", "", 1) if m["photo_path"].startswith("/photos/") else m["photo_path"]
+                key = (rel, int(m["face_index"]))
+                if key in exclude:
+                    continue
+                if key not in best or sim > best[key]["similarity"]:
+                    crop = m.get("crop_path", "")
+                    crop_url = with_v(f"/api/media/{crop.replace('/photos/', '', 1)}") if crop.startswith("/photos/") else with_v(f"/api/media/{crop}")
+                    best[key] = {
+                        "photo_path": rel,
+                        "face_index": m["face_index"],
+                        "crop_url":   crop_url,
+                        "similarity": round(sim, 4),
+                        "distance":   round(1.0 - sim, 4),
+                    }
 
-    if not best:
-        return {"results": [], "total": 0, "faces_used": len(all_indices), "buckets": bucket_info if use_temporal else None}
+        if not best:
+            return {"results": [], "total": 0, "faces_used": len(all_indices), "buckets": bucket_info if use_temporal else None}
 
-    # Remap face-index date-bucket paths → real Media-node paths so the
-    # lightbox can load the original image and photo-meta enrichment resolves.
-    # crop_url is unaffected (crops are keyed by their own path). Candidates with
-    # NO resolvable Media node (bio crops, video poster frames — faces were
-    # extracted but there's nothing to attach an APPEARS_IN edge to) are dropped:
-    # they're unassignable, so showing them just produces silent no-op assigns
-    # that reappear forever.
+        # Remap face-index date-bucket paths → real Media-node paths so the
+        # lightbox can load the original image and photo-meta enrichment resolves.
+        # crop_url is unaffected (crops are keyed by their own path). Candidates with
+        # NO resolvable Media node (bio crops, video poster frames — faces were
+        # extracted but there's nothing to attach an APPEARS_IN edge to) are dropped:
+        # they're unassignable, so showing them just produces silent no-op assigns
+        # that reappear forever.
+        # Cap the candidate set BEFORE enrichment.
+        #
+        # Everything below — resolving real paths, photo metadata, co-occurrence,
+        # event clustering — is Neo4j work proportional to the number of
+        # candidates, and body.limit was only applied at the very end. A sweep for
+        # somebody with twenty thousand confirmed faces produced tens of thousands
+        # of candidates and spent minutes enriching all of them to return a few
+        # hundred. Ten minutes, in the case that prompted this.
+        #
+        # Keeping the best ENRICH_CAP by raw similarity changes the answer only at
+        # the margin: the boosts applied below can lift a face by at most 0.16, so
+        # anything they might have promoted into a sensible-sized result is
+        # comfortably inside the cap.
+        return best
+
+    best = await asyncio.to_thread(_scan)
+
+    if len(best) > ENRICH_CAP:
+        best = dict(sorted(best.items(), key=lambda kv: -kv[1]["similarity"])[:ENRICH_CAP])
+
     real_paths = await _resolve_real_paths(list({r["photo_path"] for r in best.values()}))
     resolved_best: dict[tuple[str, int], dict] = {}
     for k, v in best.items():
