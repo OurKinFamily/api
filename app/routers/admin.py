@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
-from app.config import with_v
+from app.config import settings, with_v
 from app.db.neo4j import get_session
 from app.log import logger
 from app.services import mosaic as mosaic_svc
@@ -1757,6 +1757,21 @@ async def whoami(request: Request):
     }
 
 
+def media_is_writable() -> bool:
+    """Whether this process could change a photograph if asked.
+
+    The deployed containers mount /photos read-only, on purpose: it is what
+    stands between a bug in here and 150,000 files that exist nowhere else. So
+    rotate, crop, tone and restore work when running against the archive
+    directly and not otherwise.
+
+    The frontend asks so it can hide those controls rather than offer a button
+    that fails. Checked rather than configured — a flag saying "editing is on"
+    would eventually disagree with the mount, and the mount is the truth.
+    """
+    return os.access(settings.photos_root, os.W_OK)
+
+
 @router.get("/me")
 async def me(request: Request):
     """Current user identity. Resolved from Cloudflare Access header (or dev
@@ -1777,5 +1792,6 @@ async def me(request: Request):
         "email":           email,
         "is_admin":        is_admin_email(email),
         "can_see_gallery": can_see_gallery(email),
+        "can_edit_media":  media_is_writable(),
         "person":          dict(row) if row else None,
     }
