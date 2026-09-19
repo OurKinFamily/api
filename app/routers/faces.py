@@ -724,8 +724,10 @@ async def search_similar_faces_temporal(body: SearchByPersonTemporalBody):
                         "distance":   round(1.0 - sim, 4),
                     }
 
-        if not best:
-            return {"results": [], "total": 0, "faces_used": len(all_indices), "buckets": bucket_info if use_temporal else None}
+        # No early return for an empty sweep: this runs inside _scan, in a
+        # worker thread, so `return` here hands the caller a response body
+        # where it expects the candidate map — and the next line treats it as
+        # one. The empty case is answered after the thread instead.
 
         # Remap face-index date-bucket paths → real Media-node paths so the
         # lightbox can load the original image and photo-meta enrichment resolves.
@@ -750,6 +752,10 @@ async def search_similar_faces_temporal(body: SearchByPersonTemporalBody):
         return best
 
     best = await asyncio.to_thread(_scan)
+
+    if not best:
+        return {"results": [], "total": 0, "faces_used": len(all_indices),
+                "buckets": bucket_info if use_temporal else None}
 
     if len(best) > ENRICH_CAP:
         best = dict(sorted(best.items(), key=lambda kv: -kv[1]["similarity"])[:ENRICH_CAP])
