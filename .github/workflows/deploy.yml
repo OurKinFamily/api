@@ -18,6 +18,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      # jpegtran, same as the runtime image. The crop tests assert that a crop
+      # was lossless, and without the binary the service falls back to
+      # re-encoding and they fail — which is the tests doing their job.
+      - name: Install jpegtran
+        run: sudo apt-get update && sudo apt-get install -y libjpeg-turbo-progs
+
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
