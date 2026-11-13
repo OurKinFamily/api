@@ -94,3 +94,15 @@ jobs:
             docker compose -p ourkin-staging -f docker-compose.staging-only.yml pull api
             docker compose -p ourkin-staging -f docker-compose.staging-only.yml up -d --no-deps api
           fi
+
+      # Every `pull` above orphans the image it replaced, and nothing ever
+      # collected them. By 2026-11-13 that was 146 untagged ourkin images
+      # holding 26GB, on a disk 88% full with a growing photo archive on it —
+      # roughly 15GB a month of pure litter.
+      #
+      # Dangling-only, deliberately: an untagged image with no container
+      # cannot be referenced by anything, so this can never take out a live
+      # deploy. Volumes are NOT pruned here — the Neo4j graph lives in one,
+      # and `docker volume prune` would not know that.
+      - name: Prune the images this deploy replaced
+        run: docker image prune -f
