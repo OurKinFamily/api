@@ -693,6 +693,26 @@ async def search_similar_faces_temporal(body: SearchByPersonTemporalBody):
         best: dict[tuple[str, int], dict] = {}
         # Search with each bucket mean, keep max similarity per face
         floor = 1.0 - body.threshold
+
+        # Which rows are out of the running before ranking starts.
+        #
+        # This has to happen BEFORE the cap, not after. Capping first and
+        # excluding second looks equivalent and is not: for somebody with
+        # sixteen thousand confirmed faces, the fifteen hundred closest
+        # matches to their own bucket mean are all already theirs, so every
+        # survivor gets excluded and the page comes back empty. The people it
+        # silenced were the most-tagged ones — exactly the people you are
+        # still trying to find more of.
+        ineligible = np.zeros(matrix.shape[0], dtype=bool)
+        for i, m in enumerate(meta):
+            pp = m["photo_path"]
+            rel = pp.replace("/photos/", "", 1) if pp.startswith("/photos/") else pp
+            try:
+                if (rel, int(m["face_index"])) in exclude:
+                    ineligible[i] = True
+            except (TypeError, ValueError):
+                ineligible[i] = True
+
         for q in bucket_means:
             sims = matrix @ q
             # Select and rank in numpy rather than walking every face in Python.
@@ -703,7 +723,7 @@ async def search_similar_faces_temporal(body: SearchByPersonTemporalBody):
             # threshold that is millions of iterations, and it took over ten
             # minutes. Only the best few thousand per bucket can survive the
             # merge and the cap below, so the rest need never be touched.
-            above = np.flatnonzero(sims >= floor)
+            above = np.flatnonzero((sims >= floor) & ~ineligible)
             if above.size > ENRICH_CAP:
                 above = above[np.argpartition(-sims[above], ENRICH_CAP - 1)[:ENRICH_CAP]]
             for i in above[np.argsort(-sims[above])]:
