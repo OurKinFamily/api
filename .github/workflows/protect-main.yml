@@ -15,6 +15,14 @@ jobs:
         with:
           python-version: '3.12'
 
+      # jpegtran, same as the runtime image and the deploy workflow. The crop
+      # tests assert that a crop was lossless, and without the binary the
+      # service falls back to re-encoding and they fail — which is the tests
+      # doing their job. This step was added to deploy.yml in September and
+      # missed here, so this gate has been failing every PR since.
+      - name: Install jpegtran
+        run: sudo apt-get update && sudo apt-get install -y libjpeg-turbo-progs
+
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
