@@ -90,14 +90,27 @@ async def list_albums(request: Request, viewer_id: str | None = None):
             WITH a, item_count, latest
             ORDER BY c2.added_at DESC
             WITH a, item_count, collect(latest)[0] AS latest_media
+            // When the album happened, as opposed to when somebody made it.
+            // 245 albums generated in one minute all share a created_at, so
+            // ordering by that is arbitrary; what a reader wants is the date
+            // of the photographs.
+            OPTIONAL MATCH (a)-[:CONTAINS]->(dated:Media)
+            WHERE dated.timestamp IS NOT NULL
+            WITH a, item_count, latest_media,
+                 min(dated.timestamp) AS first_taken,
+                 max(dated.timestamp) AS last_taken
             OPTIONAL MATCH (creator:Person)-[:CREATED_ALBUM]->(a)
             RETURN a.id AS id, a.name AS name, a.description AS description,
                    coalesce(a.cover_path, latest_media.path) AS cover_path,
                    a.cover_path IS NOT NULL AS cover_is_explicit,
                    a.is_private AS is_private,
                    a.created_at AS created_at, item_count,
+                   toString(first_taken) AS first_taken,
+                   toString(last_taken) AS last_taken,
                    creator.id AS created_by_id, creator.name AS created_by_name
-            ORDER BY a.created_at DESC
+            // An empty album has no date of its own, so it falls back to when
+            // it was made rather than sorting to the bottom forever.
+            ORDER BY coalesce(first_taken, a.created_at) DESC
             """,
             uid=uid,
         )
