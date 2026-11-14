@@ -466,7 +466,12 @@ def _write_exif_gps(full_path: Path, lat: float, lon: float) -> bool:
         f"-{prefix}GPSLongitude={abs(lon)}", f"-{prefix}GPSLongitudeRef={lon_ref}",
     ]
     try:
-        r = subprocess.run(["exiftool", "-overwrite_original", *tags, str(full_path)],
+        # -P preserves FileModifyDate. Without it exiftool stamps the file as
+        # modified now, and for a photograph whose EXIF carries no date at all
+        # the filesystem time is the ONLY date it has — so writing a GPS fix
+        # silently destroyed the date. That happened once, to a real file, and
+        # it was caught by luck.
+        r = subprocess.run(["exiftool", "-P", "-overwrite_original", *tags, str(full_path)],
                            capture_output=True, text=True, timeout=60)
         return r.returncode == 0
     except Exception as e:
@@ -1330,10 +1335,21 @@ async def media_detail(path: str = Query(...)):
             # archive/0000/ junk-date photos), and that path may have only 3
             # parts. Reconstructing from the file path crashed / mismatched.
             assigned_indexes = {p.get("face_index") for p in people}
+            # Faces dismissed as nobody worth naming — the strangers in the
+            # background. Recorded on the Media node so the decision survives
+            # re-clustering. The queue counts have honoured it since it was
+            # added; this view did not, so dismissing a face here appeared to
+            # do nothing at all and the same stranger came back every time.
+            skipped_indexes = set()
+            for i in media_node.get("skipped_faces") or []:
+                try:
+                    skipped_indexes.add(int(i))
+                except (TypeError, ValueError):
+                    pass
             root = str(settings.photos_root)
             for face in fd.get("faces", []):
                 fi = face.get("face_index")
-                if fi in assigned_indexes:
+                if fi in assigned_indexes or fi in skipped_indexes:
                     continue
                 cp = face.get("crop_path")
                 if not cp:
@@ -1347,6 +1363,24 @@ async def media_detail(path: str = Query(...)):
                         "crop_url":   with_v(f"/api/media/{crop_rel}"),
                         "confidence": face.get("confidence"),
                     })
+
+            # Who each unnamed face probably is. The embeddings are already in
+            # the sidecar we just read and the brain is already in memory, so
+            # this is one matmul — cheap enough to do per view and always
+            # current, which a guess written to disk would not be.
+            if unidentified:
+                try:
+                    from app.routers.faces import _load_brain
+                    from app.services.face_guess import guess_people
+                    wanted = {f["face_index"] for f in unidentified}
+                    guesses = guess_people(
+                        _load_brain(), path,
+                        [f for f in fd.get("faces", []) if f.get("face_index") in wanted],
+                    )
+                    for f in unidentified:
+                        f["suggestion"] = guesses.get(f["face_index"])
+                except Exception as e:
+                    log.warning(f"face guess failed for {path}: {e}")
         except Exception as e:
             log.warning(f"Failed to parse faces sidecar for {path}: {e}")
 
