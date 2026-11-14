@@ -959,6 +959,30 @@ def _parse_birth(birth_raw):
         return None
 
 
+def _media_dt(raw):
+    """A Media timestamp as a naive datetime, whatever shape it arrives in.
+
+    Every timestamp in the archive looks like `2012-11-28T11:15:48.000Z` —
+    wall-clock time where the photograph was taken, with a Z that means
+    nothing. So the ages on this page are computed against a naive birth date
+    and the two sides have always matched.
+
+    Then one photograph was re-dated by hand and stored as
+    `2009-12-31T12:00:00-05:00`, the Montreal New Year. A real offset, and the
+    only one among 182,000 nodes. It parsed to an aware datetime, subtracting
+    the birth date raised `TypeError: can't subtract offset-naive and
+    offset-aware datetimes`, and the whole life-stage strip 500'd — one odd
+    value taking out every decade of somebody's life.
+
+    Dropping the offset rather than converting to UTC is deliberate: these are
+    local wall-clock times, and 20:00 in Montreal was photographed in the
+    evening, not at one in the morning the next day.
+    """
+    from datetime import datetime
+    dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+
 def _life_stage_score(p):
     """Higher = better. Solo+favorited tops the list."""
     return (
@@ -997,13 +1021,25 @@ async def _fetch_life_stage_pool(session, person_id):
     If the person has a `death_date`, photos taken meaningfully after
     death are dropped: those are posthumous shots (e.g. a framed portrait
     in the background of a later photo), not "this is what they looked
-    like at age 92"."""
+    like at age 92".
+
+    Photos whose date the archive does not trust are dropped too. This strip
+    makes one claim — here is what somebody looked like at this age — and a
+    date is the entire basis for it. Files that arrive with no usable EXIF
+    fall back to the time they were copied, which lands them in whatever
+    bucket the person is in *now*: a man born in 1986 had his age-39 slot
+    filled with Facebook photographs of himself at 25, because a 2026 import
+    run stamped them 2026. The archive already grades these `low` and files
+    them under archive/0000; the strip simply was not reading the grade.
+    Missing grades count as trustworthy — older nodes predate the field, and
+    dropping them would cost more than it saves."""
     from datetime import datetime
     res = await session.run(
         """
         MATCH (p:Person {id: $id})
         OPTIONAL MATCH (p)-[mine:APPEARS_IN]->(m:Media)
           WHERE m.timestamp IS NOT NULL AND toString(m.timestamp) > '1800-01-01'
+            AND coalesce(m.timestamp_confidence, 'high') <> 'low'
         OPTIONAL MATCH (other:Person)-[:APPEARS_IN]->(m)
         OPTIONAL MATCH (:Person)-[fav:FAVORITED]->(m)
         WITH p, m, mine,
@@ -1041,9 +1077,7 @@ async def _fetch_life_stage_pool(session, person_id):
     photos = []
     for p in raw_photos:
         try:
-            ts = datetime.fromisoformat(
-                p["ts"].split(".")[0].replace("Z", "").rstrip("+")
-            )
+            ts = _media_dt(p["ts"])
         except ValueError:
             continue
         if birth_dt is not None:
