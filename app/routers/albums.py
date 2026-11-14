@@ -10,6 +10,7 @@ didn't create — same shared-archive feel as Groups / Connections.
 """
 import os
 import uuid
+from enum import Enum
 from fastapi import APIRouter, HTTPException, Request, Query
 from pydantic import BaseModel
 from app.config import with_v
@@ -46,10 +47,27 @@ async def _current_user_id(request: Request) -> str | None:
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
 
+# What kind of album this is. A fixed set rather than free text, so the
+# gallery can filter reliably and nobody ends up with "Trip", "trips" and
+# "Travel" meaning the same thing. Mirrors Collection.type, which has done
+# the same job for scanned material since the start.
+ALBUM_KINDS = ('manual', 'holiday', 'trip', 'journey', 'birthday', 'big_day')
+
+
+class AlbumKind(str, Enum):
+    manual   = 'manual'      # made by hand — the default
+    holiday  = 'holiday'     # Christmas, Thanksgiving, Easter…
+    trip     = 'trip'        # somewhere away from home, a few days
+    journey  = 'journey'     # a run that moves between places
+    birthday = 'birthday'    # one person, one year
+    big_day  = 'big_day'     # a lot of photographs in one place on one day
+
+
 class AlbumCreate(BaseModel):
     name:        str
     description: str | None = None
     is_private:  bool       = False
+    kind:        AlbumKind  = AlbumKind.manual
 
 
 class AlbumUpdate(BaseModel):
@@ -57,6 +75,7 @@ class AlbumUpdate(BaseModel):
     description: str | None  = None
     cover_path:  str | None  = None
     is_private:  bool | None = None
+    kind:        AlbumKind | None = None
 
 
 class AlbumAddMedia(BaseModel):
@@ -90,14 +109,28 @@ async def list_albums(request: Request, viewer_id: str | None = None):
             WITH a, item_count, latest
             ORDER BY c2.added_at DESC
             WITH a, item_count, collect(latest)[0] AS latest_media
+            // When the album happened, as opposed to when somebody made it.
+            // 245 albums generated in one minute all share a created_at, so
+            // ordering by that is arbitrary; what a reader wants is the date
+            // of the photographs.
+            OPTIONAL MATCH (a)-[:CONTAINS]->(dated:Media)
+            WHERE dated.timestamp IS NOT NULL
+            WITH a, item_count, latest_media,
+                 min(dated.timestamp) AS first_taken,
+                 max(dated.timestamp) AS last_taken
             OPTIONAL MATCH (creator:Person)-[:CREATED_ALBUM]->(a)
             RETURN a.id AS id, a.name AS name, a.description AS description,
                    coalesce(a.cover_path, latest_media.path) AS cover_path,
                    a.cover_path IS NOT NULL AS cover_is_explicit,
                    a.is_private AS is_private,
                    a.created_at AS created_at, item_count,
+                   coalesce(a.kind, 'manual') AS kind,
+                   toString(first_taken) AS first_taken,
+                   toString(last_taken) AS last_taken,
                    creator.id AS created_by_id, creator.name AS created_by_name
-            ORDER BY a.created_at DESC
+            // An empty album has no date of its own, so it falls back to when
+            // it was made rather than sorting to the bottom forever.
+            ORDER BY coalesce(first_taken, a.created_at) DESC
             """,
             uid=uid,
         )
@@ -126,6 +159,7 @@ async def create_album(body: AlbumCreate, request: Request):
             """,
             uid=uid, aid=aid,
             name=body.name, description=body.description, is_private=body.is_private,
+            kind=body.kind.value,
         )
     logger.bind(
         event="album.created",
@@ -191,6 +225,24 @@ async def get_album(album_id: str, request: Request, limit: int = 500, offset: i
         )
         rows = await items_res.data()
 
+        # Everyone in the album, across every photograph in it — not only the
+        # page being shown. An album of a holiday is largely a question of who
+        # was there, and the answer should not change as you scroll.
+        people_res = await session.run(
+            """
+            MATCH (:Album {id: $aid})-[:CONTAINS]->(m:Media)<-[:APPEARS_IN]-(p:Person)
+            WITH p, count(DISTINCT m) AS appearances
+            RETURN p.id AS id,
+                   coalesce(p.known_as, p.name) AS name,
+                   p.name AS full_name,
+                   p.avatar AS avatar,
+                   appearances
+            ORDER BY appearances DESC, name
+            """,
+            aid=album_id,
+        )
+        people = await people_res.data()
+
     items = [
         {
             "path":           r["path"],
@@ -208,6 +260,7 @@ async def get_album(album_id: str, request: Request, limit: int = 500, offset: i
         **a,
         "created_by_id":   meta_row["created_by_id"],
         "created_by_name": meta_row["created_by_name"],
+        "people":          people,
         "items":           items,
         "total":           total,
         "offset":          offset,
@@ -223,6 +276,7 @@ async def update_album(album_id: str, body: AlbumUpdate, request: Request):
     if body.description is not None: sets.append("a.description = $description"); params["description"] = body.description
     if body.cover_path  is not None: sets.append("a.cover_path = $cover_path");   params["cover_path"]  = body.cover_path
     if body.is_private  is not None: sets.append("a.is_private = $is_private");   params["is_private"]  = body.is_private
+    if body.kind        is not None: sets.append("a.kind = $kind");               params["kind"]        = body.kind.value
     if not sets:
         return
     async with get_session() as session:
