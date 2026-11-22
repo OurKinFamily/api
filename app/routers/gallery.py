@@ -1,7 +1,9 @@
 """
 Gallery API — paginated media list backed by Neo4j Photo nodes.
 
-Filters: min_confidence (default: high), year_from, year_to, media_type, person_id
+Filters: min_confidence (default: all; "high"/"medium"/"low" mean that level
+and better), confidence (exactly one level), year_from, year_to, media_type,
+person_id
 Sort:    actual capture timestamp DESC
 """
 
@@ -43,16 +45,23 @@ VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.m4v', '.mpg', '.mpeg'}
 
 # Exclusive levels: each filter shows ONLY that confidence (not a floor), so
 # "Low" surfaces only the low-confidence items to review/re-date. "all" = no filter.
+# Best to worst. `min_confidence` is a MINIMUM, so "medium" means medium and
+# everything better -- which is what the name has always promised and never
+# did. Until 2026-11-22 each level mapped to a set containing only itself, so
+# picking "medium" hid the 155,677 high-confidence photographs and showed the
+# 3,484 medium ones, and no setting at all showed the whole archive.
+CONFIDENCE_ORDER = ["high", "medium", "low"]
 CONFIDENCE_SETS = {
-    "high":   ["high"],
-    "medium": ["medium"],
-    "low":    ["low"],
+    level: CONFIDENCE_ORDER[:i + 1] for i, level in enumerate(CONFIDENCE_ORDER)
 }
+# Anything outside that dict -- "all", or nothing -- applies no filter at all,
+# which also lets through the handful of nodes carrying no confidence value.
 
 
 
 def build_media_filters(
-    *, min_confidence="high", year_from=None, year_to=None, ts_from=None, ts_to=None,
+    *, min_confidence="all", confidence=None, include_hidden=False,
+    year_from=None, year_to=None, ts_from=None, ts_to=None,
     media_type="all", person_ids=None, undated=False, gps="both",
     camera_model=None, unassigned_faces=False, favorited_by=None,
 ):
@@ -76,10 +85,22 @@ def build_media_filters(
     # Phone uploads sent to "staging" get a node but stay out of the grid until
     # a future promote step flips the flag.
     conditions.append("(p.staged IS NULL OR p.staged = false)")
+    # Deliberately set aside. Distinct from `staged`, which is a waiting room:
+    # `hidden` means "this is archive material but not something to scroll
+    # past" -- 763 geocache find photos, for instance, which are a logbook
+    # rather than a family album. The filter panel can ask for them back.
+    if not include_hidden:
+        conditions.append("(p.hidden IS NULL OR p.hidden = false)")
     if undated:
         # The "0000" / no-date bucket — scanned albums and the like with no
         # timestamp at all. Confidence + year filters don't apply here.
         conditions.append("p.timestamp IS NULL")
+    elif confidence in CONFIDENCE_ORDER:
+        # Exactly this level and no other. Separate from min_confidence
+        # because "show me only the medium ones" is a real question -- it is
+        # how you find what still needs a date -- and a minimum cannot ask it.
+        conditions.append("p.timestamp_confidence = $conf_exact")
+        params["conf_exact"] = confidence
     elif min_confidence in CONFIDENCE_SETS:
         conditions.append("p.timestamp_confidence IN $conf_values")
         params["conf_values"] = CONFIDENCE_SETS[min_confidence]
@@ -149,7 +170,9 @@ async def _favoriting_person(request: Request) -> str:
 async def list_media(
     limit:          int           = Query(default=48, le=200),
     offset:         int           = Query(default=0, ge=0),
-    min_confidence: str           = Query(default="high"),
+    min_confidence: str           = Query(default="all"),   # this level and better
+    confidence:     Optional[str] = Query(default=None),    # exactly this level
+    include_hidden: bool          = Query(default=False),   # show media marked hidden
     year_from:      Optional[int] = Query(default=None),
     year_to:        Optional[int] = Query(default=None),
     ts_from:        Optional[str] = Query(default=None),       # ISO timestamp, takes precedence over year_from
@@ -167,7 +190,8 @@ async def list_media(
     favorited_by = await _favoriting_person(request) if favorites else None
     match, where, filter_params = build_media_filters(
         favorited_by=favorited_by,
-        min_confidence=min_confidence, year_from=year_from, year_to=year_to,
+        min_confidence=min_confidence, confidence=confidence,
+        include_hidden=include_hidden, year_from=year_from, year_to=year_to,
         ts_from=ts_from, ts_to=ts_to, media_type=media_type,
         person_ids=person_ids, undated=undated, gps=gps,
         camera_model=camera_model, unassigned_faces=unassigned_faces,
@@ -242,7 +266,9 @@ async def list_media(
 @router.get("/counts")
 async def media_counts(
     bucket:         str           = Query(default="month"),   # month | day
-    min_confidence: str           = Query(default="high"),
+    min_confidence: str           = Query(default="all"),   # this level and better
+    confidence:     Optional[str] = Query(default=None),    # exactly this level
+    include_hidden: bool          = Query(default=False),   # show media marked hidden
     media_type:     str           = Query(default="all"),
     person_ids:     Optional[str] = Query(default=None),
     gps:            str           = Query(default="both"),
@@ -271,7 +297,8 @@ async def media_counts(
 
     match, where, params = build_media_filters(
         favorited_by=await _favoriting_person(request) if favorites else None,
-        min_confidence=min_confidence, media_type=media_type,
+        min_confidence=min_confidence, confidence=confidence,
+        include_hidden=include_hidden, media_type=media_type,
         person_ids=person_ids, gps=gps, camera_model=camera_model,
     )
     # Undated media has no bucket to live in; the grid shows it in its own
@@ -552,6 +579,50 @@ class BulkLocationBody(LocationBody):
 
 class BulkRedateBody(RedateBody):
     paths: list[str]
+
+
+class HideBody(BaseModel):
+    """Set aside, or bring back. Graph-only — the file is untouched."""
+    paths: list[str]
+    hidden: bool = True
+    reason: Optional[str] = None
+
+
+@router.patch("/media/hidden")
+async def set_media_hidden(request: Request, body: HideBody):
+    """Mark media as hidden from the gallery, or unhide it.
+
+    Not a delete and not `staged`. `staged` is a waiting room for uploads that
+    have not been promoted; `hidden` is a decision that something belongs in
+    the archive but not in the scroll -- geocache logs, screenshots, scans of
+    paperwork. The node, the file and every relationship stay exactly as they
+    were, and `include_hidden=true` brings them back into any gallery query.
+    """
+    import uuid
+    bulk_id = uuid.uuid4().hex[:12]
+    async with get_session() as session:
+        result = await session.run(
+            """
+            UNWIND $paths AS p
+            MATCH (m:Media {path: p})
+            SET m.hidden        = $hidden,
+                m.hidden_reason = CASE WHEN $hidden THEN $reason ELSE NULL END
+            RETURN count(m) AS n
+            """,
+            paths=body.paths, hidden=body.hidden, reason=body.reason,
+        )
+        rec = await result.single()
+    updated = rec["n"] if rec else 0
+    logger.bind(
+        event="media.hidden" if body.hidden else "media.unhidden",
+        bulk_id=bulk_id,
+        count=updated,
+        requested=len(body.paths),
+        reason=body.reason,
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("media hidden" if body.hidden else "media unhidden")
+    return {"updated": updated, "requested": len(body.paths), "hidden": body.hidden}
 
 
 @router.patch("/media/location/bulk")
@@ -1163,16 +1234,21 @@ async def delete_media(request: Request, path: str = Query(...)):
 
 
 @router.get("/years")
-async def list_years(min_confidence: str = Query(default="high")):
+async def list_years(min_confidence: str = Query(default="all"),
+                     confidence: Optional[str] = Query(default=None)):
     """Distinct years that have media, with counts. Used by the date scrubber."""
     # min_confidence not in the set (e.g. "all") = no confidence filter, so
     # undated / NULL-confidence media (scanned albums etc.) become visible too.
-    conf = CONFIDENCE_SETS.get(min_confidence)
     where = "p.timestamp IS NOT NULL"
     qparams: dict = {}
-    if conf is not None:
-        where = "p.timestamp_confidence IN $conf AND " + where
-        qparams["conf"] = conf
+    if confidence in CONFIDENCE_ORDER:
+        where = "p.timestamp_confidence = $conf_exact AND " + where
+        qparams["conf_exact"] = confidence
+    else:
+        conf = CONFIDENCE_SETS.get(min_confidence)
+        if conf is not None:
+            where = "p.timestamp_confidence IN $conf AND " + where
+            qparams["conf"] = conf
     q = f"""
         MATCH (p:Media)
         WHERE {where}

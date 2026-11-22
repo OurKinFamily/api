@@ -216,7 +216,17 @@ async def get_album(album_id: str, request: Request, limit: int = 500, offset: i
             MATCH (:Album {id: $aid})-[c:CONTAINS]->(m:Media)
             RETURN m.path AS path, m.timestamp AS timestamp,
                    m.width AS width, m.height AS height,
-                   m.dominant_color AS dominant_color, m.kind AS kind,
+                   m.dominant_color AS dominant_color,
+                   // The :Video sublabel, not a `kind` property. This used to
+                   // read one, and no Media node has ever had one -- not one of
+                   // the 187,037 in the graph -- which is valid Cypher that
+                   // yields null on every row. So `is_video` was false for all
+                   // 25,896 videos, the app rendered each as an <img> pointing
+                   // at a .mov, and that draws nothing and reports nothing. The
+                   // sublabel is the schema's source of truth (api/CLAUDE.md);
+                   // the legacy `is_video` property agrees with it today, but
+                   // the label is what an import is guaranteed to set.
+                   m:Video AS is_video,
                    c.added_at AS added_at
             ORDER BY c.added_at DESC
             SKIP $offset LIMIT $limit
@@ -250,7 +260,7 @@ async def get_album(album_id: str, request: Request, limit: int = 500, offset: i
             "width":          r["width"],
             "height":         r["height"],
             "dominant_color": r["dominant_color"],
-            "is_video":       (r["kind"] == "video"),
+            "is_video":       bool(r["is_video"]),
             "added_at":       r["added_at"],
             "thumbnail_url":  with_v(f"/api/media/thumb/{(r['path'] or '').removeprefix('archive/')}"),
         }

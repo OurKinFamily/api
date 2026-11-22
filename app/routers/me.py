@@ -85,7 +85,16 @@ async def favorites(request: Request, limit: int = 100, offset: int = 0, viewer_
             RETURN m.path AS path, m.timestamp AS timestamp,
                    m.width AS width, m.height AS height,
                    m.dominant_color AS dominant_color,
-                   m.kind AS kind,
+                   // The :Video sublabel, not a `kind` property. This used to
+                   // read one, and no Media node has ever had one -- not one of
+                   // the 187,037 in the graph -- which is valid Cypher that
+                   // yields null on every row. So `is_video` was false for all
+                   // 25,896 videos, the app rendered each as an <img> pointing
+                   // at a .mov, and that draws nothing and reports nothing. The
+                   // sublabel is the schema's source of truth (api/CLAUDE.md);
+                   // the legacy `is_video` property agrees with it today, but
+                   // the label is what an import is guaranteed to set.
+                   m:Video AS is_video,
                    r.at AS favorited_at
             ORDER BY r.at DESC
             SKIP $offset LIMIT $limit
@@ -100,7 +109,7 @@ async def favorites(request: Request, limit: int = 100, offset: int = 0, viewer_
             "width":          row["width"],
             "height":         row["height"],
             "dominant_color": row["dominant_color"],
-            "is_video":       (row["kind"] == "video"),
+            "is_video":       bool(row["is_video"]),
             "favorited_at":   row["favorited_at"],
             "thumbnail_url":  with_v(f"/api/media/thumb/{(row['path'] or '').removeprefix('archive/')}"),
         }
