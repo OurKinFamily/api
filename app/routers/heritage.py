@@ -1,3 +1,4 @@
+import re
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -50,6 +51,25 @@ class CollectionUpdate(BaseModel):
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+_DIGITS = re.compile(r"(\d+)")
+
+
+def _natural_key(path: str) -> tuple:
+    """Sort key that reads the numbers in a filename as numbers.
+
+    Plain string order puts "page-10" before "page-9", which is wrong for any
+    scan batch that was not zero-padded. re.split on a capturing group always
+    alternates text, number, text, ..., starting with text, so index parity is
+    fixed: even positions are always str and odd always int. That is what makes
+    comparing two of these keys safe -- the same index in two keys is always
+    the same type, so int-vs-str never happens.
+    """
+    return tuple(
+        int(part) if i % 2 else part.lower()
+        for i, part in enumerate(_DIGITS.split(path))
+    )
+
 
 def _item_from_node(d: dict) -> dict:
     path = d["path"]
@@ -387,8 +407,27 @@ async def get_collection_items(collection_id: str, request: Request):
     items = [_item_from_node(d) for d in docs]
 
     if is_series:
-        items.sort(key=lambda x: (x["page_number"] is None, x["page_number"] or 0))
+        # A series reads in page order. Pages with no number fall back to their
+        # filename, which is the only other ordering signal a scan batch
+        # reliably carries -- EXIF is not one: the 125 pages of the Timberlane
+        # 2004 yearbook share 78 distinct EXIF:ModifyDate values between them,
+        # all written in one 2018 scanning session.
+        #
+        # The fallback is the whole point of this key. Before it, a series whose
+        # sidecars never carried `pageNumber` produced the identical sort key
+        # (True, 0) for every single item, and Python's stable sort then left the
+        # list in Neo4j's traversal order -- arbitrary, and arbitrary differently
+        # from one query plan to the next. That is what shuffled the yearbook.
+        #
+        # Unnumbered pages still sort after numbered ones. That is deliberate and
+        # unchanged: a handful of collections have one or two unnumbered inserts,
+        # and guessing where they belong is worse than putting them at the end.
+        items.sort(key=lambda x: (
+            x["page_number"] is None,
+            x["page_number"] or 0,
+            _natural_key(x["path"]),
+        ))
     else:
-        items.sort(key=lambda x: x["path"])
+        items.sort(key=lambda x: _natural_key(x["path"]))
 
     return {"items": items, "total": len(items), "is_series": is_series}

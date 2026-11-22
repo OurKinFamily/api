@@ -20,6 +20,7 @@ MEDIUM_MAX  = 1600  # longest edge in px
 THUMB_FALLBACK_ROOT = Path("/tmp/thumbs")
 THUMB_MAX = 400  # longest edge in px (matches mpp thumbnail size)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif", ".tif", ".tiff", ".bmp"}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi"}
 
 
 def _srt_to_vtt(srt: str) -> str:
@@ -117,6 +118,19 @@ async def serve_medium(path: str):
     if not src.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
+    # A video has no pixels PIL can read. serve_thumb has always known to reach
+    # for the sibling "<video>.poster.jpg"; this never did, so asking for a
+    # video at medium size raised "cannot identify image file" and returned
+    # 500. That is how an album whose first item is a video got a blank cover —
+    # the small thumb worked, the larger one did not, and nothing said why.
+    # Resize the poster rather than serving it whole: it is a full-resolution
+    # frame, and the point of this endpoint is to not send that down the wire.
+    if src.suffix.lower() in VIDEO_EXTS:
+        poster = src.parent / (src.name + ".poster.jpg")
+        if not poster.exists():
+            raise HTTPException(status_code=404, detail="No poster for this video")
+        src = poster
+
     from PIL import Image, ImageOps
     try:
         img = Image.open(src)
@@ -128,8 +142,6 @@ async def serve_medium(path: str):
         raise HTTPException(status_code=500, detail=f"resize failed: {e}")
     return FileResponse(cached, media_type="image/webp", headers=CACHE_HEADERS)
 
-
-VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi"}
 
 
 @router.get("/{path:path}")
