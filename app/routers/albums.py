@@ -51,7 +51,8 @@ async def _current_user_id(request: Request) -> str | None:
 # gallery can filter reliably and nobody ends up with "Trip", "trips" and
 # "Travel" meaning the same thing. Mirrors Collection.type, which has done
 # the same job for scanned material since the start.
-ALBUM_KINDS = ('manual', 'holiday', 'trip', 'journey', 'birthday', 'big_day')
+ALBUM_KINDS = ('manual', 'holiday', 'trip', 'journey', 'birthday', 'big_day',
+               'sporting_event')
 
 
 class AlbumKind(str, Enum):
@@ -61,6 +62,7 @@ class AlbumKind(str, Enum):
     journey  = 'journey'     # a run that moves between places
     birthday = 'birthday'    # one person, one year
     big_day  = 'big_day'     # a lot of photographs in one place on one day
+    sporting_event = 'sporting_event'   # a game, meet, match or practice
 
 
 class AlbumCreate(BaseModel):
