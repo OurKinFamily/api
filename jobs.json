@@ -66,8 +66,8 @@
         "name": "eps",
         "label": "DBSCAN eps",
         "type": "text",
-        "default": "0.3",
-        "hint": "Max cosine distance within a cluster (0.0\u20131.0). Lower = stricter / smaller / purer clusters. 0.3 is current production setting; try 0.27 if mega-clusters merge multiple people."
+        "default": "0.22",
+        "hint": "Max cosine distance within a cluster (0.0-1.0). Lower = stricter, smaller, purer clusters. 0.22 is the production setting, chosen from a parameter sweep over 20,000 sampled embeddings; 0.3 was the old default and merged distinct people into mega-clusters."
       },
       {
         "name": "min_samples",
