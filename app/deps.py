@@ -39,12 +39,5 @@ async def require_admin(request: Request) -> str:
 
 def is_admin_request(request: Request) -> bool:
     """True if the caller is an admin. For read endpoints that show more to the
-    owner (e.g. private collections / bios) than to family viewers.
-
-    When the admin is using the "View as <family member>" preview, the frontend
-    sends `X-Preview-As-Viewer`; we then report non-admin so the owner sees
-    exactly what a logged-in family member would. (Writes are unaffected — the
-    write-lock middleware checks the real email, not this.)"""
-    if request.headers.get("x-preview-as-viewer"):
-        return False
+    owner (e.g. private collections / bios) than to family viewers."""
     return is_admin_email(getattr(request.state, "user_email", None) or current_email(request))
