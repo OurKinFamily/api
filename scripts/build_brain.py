@@ -113,6 +113,14 @@ async def fetch_assignments(person_id: str | None) -> list[dict]:
             cypher = """
                 MATCH (p:Person)-[r:APPEARS_IN]->(m:Media)
                 WHERE r.face_index IS NOT NULL
+                  AND NOT coalesce(r.exclude_from_brain, false)
+// `exclude_from_brain` marks an edge as true but useless for modelling.
+// The person IS in the photograph; the crop is just no use for learning
+// their face. Parker had exactly two confirmed faces, both the
+// lowest-confidence detection in their photo (0.64, 0.62) and both tall,
+// narrow profile slivers -- and a centroid built from those two matched
+// 2,948 faces, almost none of them him. Unassigning would have been a lie
+// (he is in those pictures); this keeps the fact and drops the evidence.
                 {person_filter}
                 RETURN p.id AS pid, p.name AS pname, p.birth_date AS dob,
                        m.path AS pp, r.face_index AS fi, m.timestamp AS ts
@@ -182,6 +190,20 @@ async def main() -> int:
             person_meta[pid] = {"pname": r.get("pname"), "dob": r.get("dob")}
 
     log(f"  {len(by_person):,} distinct people with at least one assignment")
+
+    # A person who no longer has any usable face must lose their brain, not
+    # keep the last one they had. Unassigning every face, or excluding them
+    # all from the model, otherwise left a stale centroid on disk that went
+    # on making suggestions for ever -- Parker kept matching 2,948 faces off
+    # two excluded profile slivers until this was noticed.
+    if args.person_id and not by_person.get(args.person_id):
+        stale = BRAIN_DIR / f"{args.person_id}.json"
+        if stale.exists():
+            if args.dry_run:
+                log(f"  would delete stale brain: {stale}")
+            else:
+                stale.unlink()
+                log(f"  deleted stale brain (no usable faces left): {stale}")
 
     if not args.dry_run:
         BRAIN_DIR.mkdir(parents=True, exist_ok=True)

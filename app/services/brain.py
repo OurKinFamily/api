@@ -215,6 +215,14 @@ def delete_brain(person_id: str) -> bool:
 _ROWS_CYPHER = """
 MATCH (p:Person {id: $pid})-[r:APPEARS_IN]->(m:Media)
 WHERE r.face_index IS NOT NULL
+  AND NOT coalesce(r.exclude_from_brain, false)
+// `exclude_from_brain` marks an edge as true but useless for modelling.
+// The person IS in the photograph; the crop is just no use for learning
+// their face. Parker had exactly two confirmed faces, both the
+// lowest-confidence detection in their photo (0.64, 0.62) and both tall,
+// narrow profile slivers -- and a centroid built from those two matched
+// 2,948 faces, almost none of them him. Unassigning would have been a lie
+// (he is in those pictures); this keeps the fact and drops the evidence.
 RETURN p.name AS pname, p.birth_date AS dob,
        m.path AS pp, r.face_index AS fi, m.timestamp AS ts
 """
