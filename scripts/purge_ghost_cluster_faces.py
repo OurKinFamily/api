@@ -17,13 +17,21 @@ This script:
   6. Backs up the original to clusters.json.bak (overwrites prior bak)
   7. Writes the cleaned clusters.json
 
+Cluster "-1" is the noise bucket -- faces DBSCAN could not group. It was
+skipped originally because nothing read it. The singleton harvest in face
+suggestions does read it now, so a ghost in there is just as capable of
+putting a 404 on the page as one in a real cluster. --include-noise cleans
+it too; it stays opt-in so the default run keeps its old, narrower blast
+radius.
+
 Embeddings.npy + faces_meta.json are NOT touched — they're indexed by row
 position, so removing rows would invalidate every downstream lookup. The
 ghost rows stay in those files but become unreferenced.
 
 Usage:
-    python scripts/purge_ghost_cluster_faces.py            # write changes
-    python scripts/purge_ghost_cluster_faces.py --dry-run  # report only
+    python scripts/purge_ghost_cluster_faces.py                  # write changes
+    python scripts/purge_ghost_cluster_faces.py --dry-run        # report only
+    python scripts/purge_ghost_cluster_faces.py --include-noise  # clean "-1" as well
 """
 import argparse
 import json
@@ -52,6 +60,8 @@ def log(msg: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Drop ghost cluster faces (photo_path has no Media node)")
     parser.add_argument("--dry-run", action="store_true", help="report only, don't write")
+    parser.add_argument("--include-noise", action="store_true",
+                        help='also clean cluster "-1", the ungrouped faces')
     args = parser.parse_args()
 
     if not CLUSTERS_FILE.exists():
@@ -60,13 +70,16 @@ def main() -> int:
 
     log(f"loading {CLUSTERS_FILE}...")
     clusters = json.loads(CLUSTERS_FILE.read_text())
-    n_clusters_in = sum(1 for k in clusters if k != "-1")
-    n_faces_in = sum(len(v) for k, v in clusters.items() if k != "-1")
+    def in_scope(cid: str) -> bool:
+        return cid != "-1" or args.include_noise
+
+    n_clusters_in = sum(1 for k in clusters if in_scope(k))
+    n_faces_in = sum(len(v) for k, v in clusters.items() if in_scope(k))
     log(f"  {n_clusters_in:,} clusters, {n_faces_in:,} faces (excluding noise -1)")
 
     paths = set()
     for cid, faces in clusters.items():
-        if cid == "-1":
+        if not in_scope(cid):
             continue
         for f in faces:
             pp = strip_root(f.get("photo_path", ""))
@@ -117,7 +130,7 @@ def main() -> int:
     dropped_clusters = 0
     shrunk_clusters = 0
     for cid, faces in clusters.items():
-        if cid == "-1":
+        if not in_scope(cid):
             cleaned[cid] = faces
             continue
         kept = []
@@ -127,15 +140,15 @@ def main() -> int:
                 kept.append(f)
             else:
                 dropped_faces += 1
-        if not kept:
+        if not kept and cid != "-1":
             dropped_clusters += 1
             continue
         if len(kept) != len(faces):
             shrunk_clusters += 1
         cleaned[cid] = kept
 
-    n_clusters_out = sum(1 for k in cleaned if k != "-1")
-    n_faces_out = sum(len(v) for k, v in cleaned.items() if k != "-1")
+    n_clusters_out = sum(1 for k in cleaned if in_scope(k))
+    n_faces_out = sum(len(v) for k, v in cleaned.items() if in_scope(k))
     log("")
     log(f"  faces dropped       : {dropped_faces:,}")
     log(f"  clusters removed    : {dropped_clusters:,}")

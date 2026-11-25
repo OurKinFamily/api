@@ -2099,6 +2099,18 @@ def _sync_to_neo4j(person_id: str, faces: list):
                     MERGE (person)-[r:APPEARS_IN {face_index: row.face_index}]->(photo)
                     SET r.crop_path  = row.crop_path,
                         r.photo_path = row.photo_path
+                    // Naming a face settles it: it cannot also be "dismissed
+                    // as nobody worth naming". The two states used to coexist
+                    // -- an assign wrote the edge while an earlier sweep's
+                    // `exclude` had already skipped the same index -- and
+                    // 43,138 edges in the live graph held both at once. That
+                    // also broke the work-remaining sum, which is
+                    // `face_count > skipped + assigned`: double-counting one
+                    // face made photographs read as finished with a face
+                    // still unnamed.
+                    SET photo.skipped_faces =
+                        [x IN coalesce(photo.skipped_faces, [])
+                         WHERE x <> row.face_index]
                     """,
                     person_id=person_id,
                     batch=batch[i:i+200],
