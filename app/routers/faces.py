@@ -998,6 +998,64 @@ async def bulk_assign_faces(body: dict, request: Request):
     return {"assigned": assigned_count, "missing": missing, "requested": len(faces)}
 
 
+class BrainExclusionBody(BaseModel):
+    person_id: str
+    photo_path: str
+    face_index: int
+    exclude: bool = True
+
+
+@router.patch("/assignment/brain-exclusion", status_code=204)
+async def set_brain_exclusion(request: Request, body: BrainExclusionBody):
+    """Keep the assignment, stop it teaching the model.
+
+    Some crops are true and useless at the same time: the person really is in
+    the photograph, but the detector caught a profile sliver, or a face three
+    pixels wide at the back of a hall. Unassigning says "that is not them",
+    which is false, and loses the record that they were there. This says
+    "that is them, but do not learn their face from it".
+
+    Parker was the case that asked for it. Two confirmed faces, both the
+    lowest-confidence detection in their photograph (0.64 and 0.62) and both
+    tall, narrow profile slivers. A centroid built from those two matched
+    2,948 faces, nearly none of them him.
+    """
+    pp = body.photo_path
+    pp = pp.replace("/photos/", "", 1) if pp.startswith("/photos/") else pp
+    async with get_session() as session:
+        res = await session.run(
+            """
+            MATCH (p:Person {id: $person_id})-[r:APPEARS_IN]->(m:Media {path: $pp})
+            WHERE r.face_index = $face_index
+            SET r.exclude_from_brain = $exclude
+            RETURN 1 AS ok
+            """,
+            person_id=body.person_id, pp=pp,
+            face_index=body.face_index, exclude=body.exclude,
+        )
+        if not await res.single():
+            raise HTTPException(404, "Assignment not found")
+
+        # The centroids change the moment this flips, so rebuild here rather
+        # than leaving a stale brain to keep making the suggestion.
+        try:
+            from app.services.brain import rebuild_person_brain
+            await rebuild_person_brain(body.person_id, session)
+            _invalidate_brain()
+        except Exception as e:
+            log.warning(f"brain rebuild failed for {body.person_id}: {e}")
+
+    log.bind(
+        event="face.brain_exclusion.set",
+        person_id=body.person_id,
+        photo_path=pp,
+        face_index=body.face_index,
+        excluded=body.exclude,
+        by=getattr(request.state, "user_email", None),
+        request_id=getattr(request.state, "request_id", None),
+    ).info("face excluded from brain" if body.exclude else "face restored to brain")
+
+
 @router.delete("/assignment", status_code=204)
 async def unassign_face(request: Request, person_id: str, photo_path: str, face_index: int):
     """Remove the APPEARS_IN edge for a specific (person, photo, face_index)
