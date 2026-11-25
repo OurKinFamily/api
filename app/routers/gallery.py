@@ -1382,6 +1382,16 @@ async def media_detail(path: str = Query(...)):
 
     # Read faces sidecar — face count + bbox lookup by face_index
     unidentified = []
+    # Faces dismissed in triage. Kept OUT of `unidentified` so a stranger
+    # stays dismissed, but handed back separately so they can be recovered.
+    #
+    # A skip is written for every face the person did not tick, which on a
+    # person-specific sweep means "not David" rather than "nobody". In a
+    # family archive most photographs of one relative contain another, so
+    # that quietly buried real people: 2018-11-22_16-08-42_001.jpg had
+    # Henry's face dismissed while David was being confirmed, and Henry
+    # could then never be named from his own photograph.
+    dismissed = []
     faces_sidecar = Path(str(full_path) + ".faces.json")
     if faces_sidecar.exists():
         try:
@@ -1411,11 +1421,21 @@ async def media_detail(path: str = Query(...)):
             # archive/0000/ junk-date photos), and that path may have only 3
             # parts. Reconstructing from the file path crashed / mismatched.
             assigned_indexes = {p.get("face_index") for p in people}
-            # Faces dismissed as nobody worth naming — the strangers in the
-            # background. Recorded on the Media node so the decision survives
-            # re-clustering. The queue counts have honoured it since it was
-            # added; this view did not, so dismissing a face here appeared to
-            # do nothing at all and the same stranger came back every time.
+            # Faces dismissed during triage. They are STILL RETURNED here,
+            # flagged, rather than hidden.
+            #
+            # A skip is written by the assign endpoints for every face the
+            # person did not tick, which on a person-specific sweep means
+            # "not David" — not "nobody". In a family archive most photographs
+            # of one relative contain another, so that buried real people:
+            # 2018-11-22_16-08-42_001.jpg had Henry's face skipped while David
+            # was being confirmed, and Henry then could not be named from his
+            # own photograph. Worse, the search endpoints never consulted the
+            # list at all, so the skip did not even keep that sweep tidy.
+            #
+            # The skip still does its job in the triage queue and the gallery
+            # counts. It has no business hiding a face from the one screen
+            # where somebody can put a name to it.
             skipped_indexes = set()
             for i in media_node.get("skipped_faces") or []:
                 try:
@@ -1425,20 +1445,22 @@ async def media_detail(path: str = Query(...)):
             root = str(settings.photos_root)
             for face in fd.get("faces", []):
                 fi = face.get("face_index")
-                if fi in assigned_indexes or fi in skipped_indexes:
+                if fi in assigned_indexes:
                     continue
+                dismissed_here = fi in skipped_indexes
                 cp = face.get("crop_path")
                 if not cp:
                     continue
                 crop_rel = cp.removeprefix(root + "/").removeprefix("/photos/").lstrip("/")
                 if (settings.photos_root / crop_rel).exists():
-                    unidentified.append({
+                    entry = {
                         "face_index": fi,
                         "bbox":       face.get("bbox"),
                         "crop_path":  crop_rel,
                         "crop_url":   with_v(f"/api/media/{crop_rel}"),
                         "confidence": face.get("confidence"),
-                    })
+                    }
+                    (dismissed if dismissed_here else unidentified).append(entry)
 
             # Who each unnamed face probably is. The embeddings are already in
             # the sidecar we just read and the brain is already in memory, so
@@ -1478,7 +1500,7 @@ async def media_detail(path: str = Query(...)):
         return {
             **base,
             "people": people, "face_count": face_count,
-            "unidentified": unidentified, "objects": objects,
+            "unidentified": unidentified, "dismissed": dismissed, "objects": objects,
             "description": media_node.get("description"),
             "heritage": heritage,
         }
@@ -1533,6 +1555,7 @@ async def media_detail(path: str = Query(...)):
             "people":      people,
             "face_count":  face_count,
             "unidentified": unidentified,
+            "dismissed": dismissed,
             "objects":     objects,
             "heritage":    heritage,
             "sidecar":     meta,
@@ -1633,6 +1656,6 @@ async def media_detail(path: str = Query(...)):
         return {
             **base,
             "people": people, "face_count": face_count,
-            "unidentified": unidentified, "objects": objects,
+            "unidentified": unidentified, "dismissed": dismissed, "objects": objects,
             "heritage": heritage,
         }
